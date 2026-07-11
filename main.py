@@ -1,355 +1,430 @@
-"""
-HoiBai Content Moderation API
-FastAPI server để chạy inference model phoBERT trên CPU
-- Railway/Render compatible
-- Health check endpoint
-- Batch prediction support (real batch, không loop)
-- Tối ưu CPU: dynamic quantization, thread control, inference_mode
-"""
-
-import os
-import json
-import re
-import unicodedata
-import time
+import os, re, unicodedata, asyncio, json
 from contextlib import asynccontextmanager
-from typing import List, Optional
-
-# Tối ưu CPU - set trước khi import torch
-# Phải set trước import torch để có hiệu lực
-os.environ.setdefault("OMP_NUM_THREADS", "4")
-os.environ.setdefault("MKL_NUM_THREADS", "4")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+from typing import Optional
 
 import torch
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-# Cho phép CPU dùng TF32 (nếu hỗ trợ) - tăng tốc độ matmul
-torch.set_float32_matmul_precision('high')
+# ── Config ────────────────────────────────────────────────────────────────────
+MODEL_PATH      = os.getenv("MODEL_PATH",           "./model")
+SUPABASE_URL    = os.getenv("SUPABASE_URL",          "")
+SUPABASE_KEY    = os.getenv("SUPABASE_SERVICE_KEY",  "")
+CONFIDENCE_THR  = float(os.getenv("CONFIDENCE_THR", "0.65"))
+SCAN_INTERVAL   = int(os.getenv("SCAN_INTERVAL",    "10"))    # giây
+BATCH_SIZE      = int(os.getenv("BATCH_SIZE",       "10"))
+MAX_LENGTH      = 128
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-MODEL_DIR = os.environ.get("MODEL_DIR", "./hoibai_moderation_model")
-MAX_LENGTH = 128
-THRESHOLD_SAFE = 0.75
-BATCH_SIZE = 16
+LABEL_NAMES = {0: "CLEAN", 1: "SPAM", 2: "TOXIC", 3: "MEANINGLESS"}
 
-# Bật/tắt quantization INT8 (giảm 2-4x tốc độ inference + RAM)
-# Set USE_QUANTIZATION=true để bật
-USE_QUANTIZATION = os.environ.get("USE_QUANTIZATION", "true").lower() == "true"
+# ── Globals ───────────────────────────────────────────────────────────────────
+tokenizer  = None
+model      = None
+device     = None
+supabase   = None
+scan_task  = None
 
-LABEL_MAP = {0: "CLEAN", 1: "SPAM", 2: "TOXIC", 3: "MEANINGLESS"}
-ACTION_MAP = {
-    "CLEAN": "allow",
-    "SPAM": "flag",
-    "TOXIC": "block",
-    "MEANINGLESS": "flag",
-}
-
-# ---------------------------------------------------------------------------
-# Text cleaning (match training preprocessing)
-# ---------------------------------------------------------------------------
-
-def clean_text(text: str) -> str:
-    if not text:
-        return ""
-    text = unicodedata.normalize("NFC", text)
-    text = re.sub(
-        r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+",
-        "[URL]",
-        text,
-    )
-    text = re.sub(r"\b0\d{9,10}\b", "[PHONE]", text)
-    text = re.sub(r"\S+@\S+\.\S+", "[EMAIL]", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text.lower()
-
-
-# ---------------------------------------------------------------------------
-# Model holder
-# ---------------------------------------------------------------------------
-
-class ModelHolder:
-    def __init__(self):
-        self.tokenizer: Optional[AutoTokenizer] = None
-        self.model: Optional[AutoModelForSequenceClassification] = None
-        self.device: Optional[torch.device] = None
-        self.ready: bool = False
-
-    def load(self):
-        print(f"[INFO] Loading model from: {MODEL_DIR}")
-        start = time.time()
-
-        if not os.path.exists(MODEL_DIR):
-            raise FileNotFoundError(f"Model directory not found: {MODEL_DIR}")
-
-        self.device = torch.device("cpu")
-
-        # Set số thread cho PyTorch (mặc định 4, override qua env)
-        num_threads = int(os.environ.get("TORCH_NUM_THREADS", "4"))
-        torch.set_num_threads(num_threads)
-        torch.set_num_interop_threads(2)
-        print(f"[INFO] PyTorch threads: {num_threads}")
-
-        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-        self.model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
-
-        # Quantization INT8 cho các lớp Linear - giảm 2-4x inference time
-        if USE_QUANTIZATION:
-            print("[INFO] Applying dynamic quantization (INT8)...")
-            self.model = torch.quantization.quantize_dynamic(
-                self.model,
-                {torch.nn.Linear},
-                dtype=torch.qint8,
-            )
-            print("[INFO] Quantization done")
-
-        self.model = self.model.to(self.device)
-        self.model.eval()
-        self.ready = True
-
-        elapsed = time.time() - start
-        print(f"[INFO] Model loaded in {elapsed:.2f}s")
-        print(f"[INFO] Device: {self.device}")
-        param_count = sum(p.numel() for p in self.model.parameters())
-        print(f"[INFO] Parameters: {param_count:,}")
-
-        # Warmup - chạy 1 request giả để JIT compile, cache warm
-        self._warmup()
-
-    def _warmup(self):
-        """Chạy 1 inference warmup để JIT compile, tránh cold start lag."""
-        print("[INFO] Warming up model...")
-        start = time.time()
-        dummy = "warmup test content"
-        inputs = self.tokenizer(
-            dummy,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=MAX_LENGTH,
-        )
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        with torch.inference_mode():
-            _ = self.model(**inputs)
-        print(f"[INFO] Warmup done in {time.time() - start:.2f}s")
-
-    def predict(self, text: str, content_type: str = "question") -> dict:
-        if not self.ready:
-            raise RuntimeError("Model not loaded")
-
-        cleaned = clean_text(text)
-        combined = f"[{content_type.upper()}] {cleaned}"
-
-        inputs = self.tokenizer(
-            combined,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=MAX_LENGTH,
-        )
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-        # inference_mode nhanh hơn no_grad ~10-20%
-        with torch.inference_mode():
-            outputs = self.model(**inputs)
-            probs = torch.softmax(outputs.logits, dim=-1)
-            pred = torch.argmax(probs, dim=-1).item()
-            confidence = probs[0][pred].item()
-            all_probs = probs[0].cpu().numpy()
-
-        label = LABEL_MAP[pred]
-        return {
-            "text_preview": text[:100] + "..." if len(text) > 100 else text,
-            "predicted_label": label,
-            "label_id": pred,
-            "confidence": round(confidence, 4),
-            "action": ACTION_MAP[label],
-            "all_scores": {
-                LABEL_MAP[i]: round(float(p), 4) for i, p in enumerate(all_probs)
-            },
-            "should_block": label in ("SPAM", "TOXIC", "MEANINGLESS"),
-        }
-
-    def predict_batch(self, items: List[dict]) -> List[dict]:
-        """Real batch prediction - tokenize & infer nhiều item cùng lúc."""
-        if not self.ready:
-            raise RuntimeError("Model not loaded")
-        if not items:
-            return []
-
-        results = []
-        # Chia thành các batch nhỏ để tránh OOM
-        for i in range(0, len(items), BATCH_SIZE):
-            batch = items[i:i + BATCH_SIZE]
-            texts = []
-            for it in batch:
-                t = it.get("text", "")
-                ct = it.get("type", "question")
-                cleaned = clean_text(t)
-                texts.append(f"[{ct.upper()}] {cleaned}")
-
-            # Tokenize batch
-            inputs = self.tokenizer(
-                texts,
-                return_tensors="pt",
-                padding="max_length",
-                truncation=True,
-                max_length=MAX_LENGTH,
-            )
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-            with torch.inference_mode():
-                outputs = self.model(**inputs)
-                probs = torch.softmax(outputs.logits, dim=-1)
-                preds = torch.argmax(probs, dim=-1).cpu().numpy()
-                confs = probs.max(dim=-1).values.cpu().numpy()
-
-            for j, it in enumerate(batch):
-                pred = int(preds[j])
-                label = LABEL_MAP[pred]
-                results.append({
-                    "id": it.get("id"),
-                    "text_preview": it.get("text", "")[:100],
-                    "predicted_label": label,
-                    "label_id": pred,
-                    "confidence": round(float(confs[j]), 4),
-                    "action": ACTION_MAP[label],
-                    "should_block": label in ("SPAM", "TOXIC", "MEANINGLESS"),
-                })
-
-        return results
-
-
-model_holder = ModelHolder()
-
-
-# ---------------------------------------------------------------------------
-# Lifespan
-# ---------------------------------------------------------------------------
-
+# ── Startup / Shutdown ────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    model_holder.load()
+    global tokenizer, model, device, supabase, scan_task
+
+    # Load model
+    print(f"⏳ Loading model từ {MODEL_PATH}...")
+    device    = torch.device("cpu")  # Northflank free = CPU
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+    model     = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
+    model     = model.to(device)
+    model.eval()
+
+    total = sum(p.numel() for p in model.parameters())
+    print(f"✅ Model loaded! {total/1e6:.1f}M params | Device: {device}")
+
+    # Kết nối Supabase nếu có
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            from supabase import create_client
+            supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+            print("✅ Supabase connected!")
+
+            # Bắt đầu background scanner
+            scan_task = asyncio.create_task(scanner_loop())
+            print("🔄 Background scanner started!")
+        except Exception as e:
+            print(f"⚠️  Supabase error: {e} → Scanner disabled")
+    else:
+        print("ℹ️  Supabase chưa cấu hình → Scanner disabled")
+
     yield
-    print("[INFO] Shutting down...")
 
-
-# ---------------------------------------------------------------------------
-# FastAPI App
-# ---------------------------------------------------------------------------
+    # Cleanup
+    if scan_task:
+        scan_task.cancel()
+        try:
+            await scan_task
+        except asyncio.CancelledError:
+            pass
+    print("👋 Shutdown complete!")
 
 app = FastAPI(
-    title="HoiBai Content Moderation API",
-    description="API phân loại nội dung CLEAN/SPAM/TOXIC/MEANINGLESS cho nền tảng hỏi đáp bài tập",
-    version="1.1.0",
-    lifespan=lifespan,
+    title       = "HoiBai ML Moderator",
+    description = "Content moderation API cho HoiBai K1-12",
+    version     = "2.0.0",
+    lifespan    = lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins  = ["*"],
+    allow_methods  = ["POST", "GET"],
+    allow_headers  = ["*"],
 )
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def clean_text(text: str) -> str:
+    """Làm sạch text theo cách notebook đã train"""
+    if not text: return ""
+    text = unicodedata.normalize("NFC", text)
+    text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '[URL]', text)
+    text = re.sub(r'\b0\d{9,10}\b', '[PHONE]', text)
+    text = re.sub(r'\S+@\S+\.\S+', '[EMAIL]', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text.lower()
 
-# ---------------------------------------------------------------------------
-# Pydantic Schemas
-# ---------------------------------------------------------------------------
+def hard_rules(text: str) -> tuple[Optional[str], str]:
+    """Rule cứng không cần model"""
+    t = text.strip()
+    if len(t) < 2:
+        return "MEANINGLESS", "Quá ngắn"
+    if re.match(r'^(.)\1+$', t):
+        return "MEANINGLESS", "Ký tự lặp"
+    if re.match(r'^\d+$', t):
+        return "MEANINGLESS", "Toàn số"
+    if not re.search(
+        r'[a-zA-Z'
+        r'àáảãạăắặẳẵậâấầẩẫèéẻẽẹêếềểễệ'
+        r'ìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụ'
+        r'ưứừửữựỳýỷỹỵđ]', t, re.IGNORECASE
+    ):
+        return "MEANINGLESS", "Không có chữ cái"
+    return None, ""
 
-class PredictRequest(BaseModel):
-    text: str = Field(..., min_length=1, max_length=2000, description="Nội dung cần kiểm tra")
-    type: str = Field(default="question", pattern="^(question|answer)$")
+def ml_classify(text: str, content_type: str = "question") -> tuple[str, float, str]:
+    """Classify bằng PhoBERT — match đúng format notebook đã train"""
+    # Thêm prefix [QUESTION] hoặc [ANSWER] như notebook
+    prefix  = f"[{content_type.upper()}]"
+    cleaned = clean_text(text)
+    if not cleaned:
+        return "MEANINGLESS", 1.0, "Text rỗng sau clean"
 
+    combined = f"{prefix} {cleaned}"
 
-class BatchPredictRequest(BaseModel):
-    items: List[dict] = Field(..., description="List các items, mỗi item có 'text', 'type', 'id' (optional)")
+    inputs = tokenizer(
+        combined,
+        return_tensors  = "pt",
+        padding         = "max_length",
+        truncation      = True,
+        max_length      = MAX_LENGTH,
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
 
+    with torch.no_grad():
+        outputs = model(**inputs)
+        probs   = torch.softmax(outputs.logits, dim=-1)
+        pred    = torch.argmax(probs, dim=-1).item()
+        conf    = probs[0][pred].item()
 
-class PredictResponse(BaseModel):
-    text_preview: str
-    predicted_label: str
-    label_id: int
+    label = LABEL_NAMES[pred]
+
+    # Nếu không chắc thì cho qua
+    if label != "CLEAN" and conf < CONFIDENCE_THR:
+        return "CLEAN", conf, f"Dưới ngưỡng {CONFIDENCE_THR:.0%}"
+
+    return label, round(conf, 4), ""
+
+def classify(text: str, content_type: str = "question") -> tuple[str, float, str]:
+    """Full pipeline: hard rules → ML"""
+    label, reason = hard_rules(text)
+    if label:
+        return label, 1.0, reason
+    return ml_classify(text, content_type)
+
+# ── Background Scanner ─────────────────────────────────────────────────────────
+async def scanner_loop():
+    """Quét liên tục nội dung pending trong Supabase"""
+    consecutive_empty = 0
+    print("🔍 Scanner loop started!")
+
+    while True:
+        try:
+            count = await scan_batch()
+
+            if count == 0:
+                consecutive_empty += 1
+                # Ngủ lâu hơn nếu không có gì
+                sleep_time = min(SCAN_INTERVAL * consecutive_empty, 300)
+                await asyncio.sleep(sleep_time)
+            else:
+                consecutive_empty = 0
+                await asyncio.sleep(SCAN_INTERVAL)
+
+        except asyncio.CancelledError:
+            print("🛑 Scanner stopped!")
+            break
+        except Exception as e:
+            print(f"❌ Scanner error: {e}")
+            await asyncio.sleep(30)
+
+async def scan_batch() -> int:
+    """Quét 1 batch pending items"""
+    if not supabase:
+        return 0
+
+    try:
+        # Lấy pending questions
+        qs = supabase.table("questions")\
+            .select("id,title,body,user_id,points_cost")\
+            .eq("status", "pending")\
+            .limit(BATCH_SIZE)\
+            .execute()
+
+        # Lấy pending answers
+        ans = supabase.table("answers")\
+            .select("id,body,user_id")\
+            .eq("moderation_status", "pending")\
+            .limit(BATCH_SIZE)\
+            .execute()
+
+        items = []
+        for q in (qs.data or []):
+            text = f"{q['title']} {q.get('body','') or ''}"
+            items.append(("question", q, text))
+        for a in (ans.data or []):
+            items.append(("answer", a, a["body"]))
+
+        if not items:
+            return 0
+
+        print(f"🔍 Quét {len(items)} items...")
+
+        for itype, data, text in items:
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: process_item_sync(itype, data, text)
+            )
+
+        return len(items)
+
+    except Exception as e:
+        print(f"❌ scan_batch error: {e}")
+        return 0
+
+def process_item_sync(itype: str, data: dict, text: str):
+    """Xử lý 1 item (sync vì ML là CPU-bound)"""
+    try:
+        label, conf, reason = classify(text, itype)
+        allowed = label == "CLEAN"
+
+        print(f"  [{itype}] {data['id'][:8]}... → {label} ({conf:.0%}){' | '+reason if reason else ''}")
+
+        if itype == "question":
+            _handle_question(data, label, allowed, reason, conf)
+        elif itype == "answer":
+            _handle_answer(data, label, allowed, reason, conf)
+
+    except Exception as e:
+        print(f"  ❌ process error {data.get('id','?')}: {e}")
+
+def _handle_question(q: dict, label: str, allowed: bool, reason: str, conf: float):
+    if allowed:
+        supabase.table("questions")\
+            .update({"status": "open"})\
+            .eq("id", q["id"]).execute()
+    else:
+        # Xóa câu hỏi
+        supabase.table("questions")\
+            .delete().eq("id", q["id"]).execute()
+
+        # Hoàn điểm
+        try:
+            profile = supabase.table("profiles")\
+                .select("points").eq("id", q["user_id"])\
+                .single().execute()
+            if profile.data:
+                new_pts = profile.data["points"] + q.get("points_cost", 0)
+                supabase.table("profiles")\
+                    .update({"points": new_pts})\
+                    .eq("id", q["user_id"]).execute()
+                supabase.table("point_transactions").insert({
+                    "user_id": q["user_id"],
+                    "amount" : q.get("points_cost", 0),
+                    "reason" : "refund_violation",
+                    "ref_id" : q["id"],
+                }).execute()
+        except Exception as e:
+            print(f"  ⚠️  Hoàn điểm lỗi: {e}")
+
+        # Ghi log
+        _log_violation(q["user_id"], q["id"], "question", label, reason, conf)
+        print(f"  🚫 Deleted question {q['id'][:8]} → {label}")
+
+def _handle_answer(a: dict, label: str, allowed: bool, reason: str, conf: float):
+    if allowed:
+        supabase.table("answers")\
+            .update({"moderation_status": "approved"})\
+            .eq("id", a["id"]).execute()
+    else:
+        supabase.table("answers")\
+            .delete().eq("id", a["id"]).execute()
+        _log_violation(a["user_id"], a["id"], "answer", label, reason, conf)
+        print(f"  🚫 Deleted answer {a['id'][:8]} → {label}")
+
+def _log_violation(user_id, ref_id, ref_type, label, reason, conf):
+    try:
+        supabase.table("moderation_logs").insert({
+            "user_id"   : user_id,
+            "ref_id"    : ref_id,
+            "ref_type"  : ref_type,
+            "label"     : label,
+            "reason"    : reason or f"ML {conf:.0%}",
+            "action"    : "deleted",
+        }).execute()
+    except Exception as e:
+        print(f"  ⚠️  Log error: {e}")
+
+# ── Schemas ───────────────────────────────────────────────────────────────────
+class ModerateRequest(BaseModel):
+    text   : str
+    context: str = "question"  # "question" | "answer"
+
+class ModerateResponse(BaseModel):
+    label     : str
     confidence: float
-    action: str
-    all_scores: dict
-    should_block: bool
+    allowed   : bool
+    reason    : str
+    scores    : dict = {}
 
+class BatchRequest(BaseModel):
+    items: list[dict]  # [{"text": "...", "context": "question"}]
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+@app.post("/moderate", response_model=ModerateResponse)
+async def moderate(req: ModerateRequest):
+    """Kiểm duyệt 1 nội dung — dùng trong PHP ask.php / question.php"""
+    if model is None:
+        # Fallback: cho phép nếu model chưa load
+        return ModerateResponse(
+            label="CLEAN", confidence=0.5,
+            allowed=True, reason="Model loading..."
+        )
+
+    loop  = asyncio.get_event_loop()
+    label, conf, reason = await loop.run_in_executor(
+        None, lambda: classify(req.text, req.context)
+    )
+
+    return ModerateResponse(
+        label      = label,
+        confidence = conf,
+        allowed    = label == "CLEAN",
+        reason     = reason,
+    )
+
+@app.post("/moderate/batch")
+async def moderate_batch(req: BatchRequest):
+    """Kiểm duyệt nhiều nội dung cùng lúc"""
+    if not req.items:
+        return {"results": []}
+
+    if model is None:
+        return {"results": [
+            {"label":"CLEAN","confidence":0.5,"allowed":True,"reason":"Model loading"}
+            for _ in req.items
+        ]}
+
+    loop    = asyncio.get_event_loop()
+    results = []
+
+    for item in req.items[:50]:  # Giới hạn 50 items/batch
+        text    = item.get("text", "")
+        context = item.get("context", "question")
+        label, conf, reason = await loop.run_in_executor(
+            None, lambda: classify(text, context)
+        )
+        results.append({
+            "label"     : label,
+            "confidence": conf,
+            "allowed"   : label == "CLEAN",
+            "reason"    : reason,
+        })
+
+    return {"results": results, "count": len(results)}
+
+@app.get("/health")
+async def health():
+    """Health check — Northflank dùng để monitor"""
+    pending_q = pending_a = 0
+
+    if supabase:
+        try:
+            pq = supabase.table("questions")\
+                .select("id", count="exact")\
+                .eq("status", "pending").execute()
+            pa = supabase.table("answers")\
+                .select("id", count="exact")\
+                .eq("moderation_status", "pending").execute()
+            pending_q = pq.count or 0
+            pending_a = pa.count or 0
+        except:
+            pass
+
+    return {
+        "status"      : "ok",
+        "model_loaded": model is not None,
+        "device"      : str(device) if device else "unknown",
+        "scanner"     : "running" if (supabase and scan_task and not scan_task.done()) else "disabled",
+        "pending"     : {
+            "questions": pending_q,
+            "answers"  : pending_a,
+        },
+        "version"     : "2.0.0",
+    }
+
+@app.get("/stats")
+async def stats():
+    """Thống kê moderation"""
+    if not supabase:
+        return {"error": "Supabase not configured"}
+
+    try:
+        logs = supabase.table("moderation_logs")\
+            .select("label, ref_type")\
+            .execute()
+
+        from collections import Counter
+        label_counts = Counter(r["label"]    for r in (logs.data or []))
+        type_counts  = Counter(r["ref_type"] for r in (logs.data or []))
+
+        return {
+            "total_violations": len(logs.data or []),
+            "by_label"        : dict(label_counts),
+            "by_type"         : dict(type_counts),
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.get("/")
 async def root():
     return {
-        "service": "HoiBai Content Moderation API",
-        "version": "1.1.0",
-        "status": "ready" if model_holder.ready else "loading",
-        "model": "vinai/phobert-base (fine-tuned, INT8 quantized)",
-        "labels": LABEL_MAP,
-    }
-
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "healthy" if model_holder.ready else "loading",
-        "model_loaded": model_holder.ready,
-    }
-
-
-@app.post("/predict", response_model=PredictResponse)
-async def predict(req: PredictRequest):
-    if not model_holder.ready:
-        raise HTTPException(status_code=503, detail="Model chưa load xong")
-    try:
-        return model_holder.predict(req.text, req.type)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/predict/batch")
-async def predict_batch(req: BatchPredictRequest):
-    if not model_holder.ready:
-        raise HTTPException(status_code=503, detail="Model chưa load xong")
-    try:
-        results = model_holder.predict_batch(req.items)
-        return {"results": results, "count": len(results)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/check")
-async def check_content(req: PredictRequest):
-    """Endpoint đơn giản để tích hợp với PHP backend."""
-    if not model_holder.ready:
-        raise HTTPException(status_code=503, detail="Model chưa load xong")
-    try:
-        result = model_holder.predict(req.text, req.type)
-        return {
-            "is_clean": result["predicted_label"] == "CLEAN",
-            "label": result["predicted_label"],
-            "confidence": result["confidence"],
-            "action": result["action"],
-            "should_block": result["should_block"],
+        "service": "HoiBai ML Moderator",
+        "version": "2.0.0",
+        "endpoints": {
+            "POST /moderate"       : "Kiểm duyệt 1 nội dung",
+            "POST /moderate/batch" : "Kiểm duyệt nhiều nội dung",
+            "GET  /health"         : "Health check",
+            "GET  /stats"          : "Thống kê vi phạm",
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ---------------------------------------------------------------------------
-# Run local
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    }
