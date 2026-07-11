@@ -1,0 +1,36 @@
+{
+  "apiVersion": "v1",
+  "spec": {
+    "kind": "DeploymentService",
+    "spec": {
+      "name": "hoibai-ml-api",
+      "billing": {
+        "deploymentPlan": "nf-compute-10"
+      },
+      "deployment": {
+        "instances": 1,
+        "docker": {
+          "configType": "customCommand",
+          "customCommand": "uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1"
+        },
+        "buildpack": {
+          "configType": "autodetect"
+        }
+      },
+      "ports": [
+        {
+          "name": "http",
+          "internalPort": 8000,
+          "public": true,
+          "protocol": "HTTP"
+        }
+      ],
+      "runtimeEnvironment": {
+        "MODEL_PATH"           : "./model",
+        "CONFIDENCE_THR"       : "0.65",
+        "SCAN_INTERVAL"        : "10",
+        "BATCH_SIZE"           : "10"
+      }
+    }
+  }
+}
