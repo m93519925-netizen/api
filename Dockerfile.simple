@@ -1,0 +1,42 @@
+# Dockerfile cho Railway / Render
+# Pull model từ HuggingFace Hub lúc build
+
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Cài system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    libgomp1 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements trước để cache layer
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy code
+COPY main.py .
+
+# Pull model từ HuggingFace Hub
+ARG HF_MODEL_REPO=dsdsdewe/hoibai-moderation-phobert
+ENV HF_MODEL_REPO=${HF_MODEL_REPO}
+ENV MODEL_DIR=/app/hoibai_moderation_model
+
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='${HF_MODEL_REPO}', local_dir='${MODEL_DIR}')"
+
+# Verify
+RUN python -c "import os; files = os.listdir('${MODEL_DIR}'); print('Model files:', files)"
+
+# Cấu hình CPU
+ENV OMP_NUM_THREADS=4
+ENV MKL_NUM_THREADS=4
+ENV TOKENIZERS_PARALLELISM=false
+
+ENV PORT=8000
+
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--loop", "asyncio"]
