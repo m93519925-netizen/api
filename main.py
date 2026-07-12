@@ -121,29 +121,46 @@ def ai_classify(text: str, content_type: str = "question") -> tuple:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": user_prompt},
             ],
-            max_tokens  = 100,
-            temperature = 0.1,  # Thấp để kết quả ổn định
+            max_tokens  = 300,        # FIX: 100 quá thấp -> JSON bị cắt giữa chừng
+            temperature = 0.1,
         )
 
-        raw = response.choices[0].message.content.strip()
+        raw          = response.choices[0].message.content.strip()
+        finish_reason= response.choices[0].finish_reason
 
-        # Parse JSON
         import json
-        # Tìm JSON trong response
+
+        # 1) Thử parse JSON đầy đủ trước
+        data = None
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         if match:
-            data       = json.loads(match.group())
-            label      = data.get("label", "CLEAN").upper()
-            confidence = float(data.get("confidence", 0.8))
-            reason     = data.get("reason", "")
+            try:
+                data = json.loads(match.group())
+            except json.JSONDecodeError:
+                data = None
 
-            # Validate label
+        # 2) Fallback: JSON bị cắt ngang (finish_reason == 'length')
+        #    Tìm thủ công từng field thay vì yêu cầu JSON hoàn chỉnh
+        if data is None:
+            label_m = re.search(r'"label"\s*:\s*"([^"]+)"', raw)
+            conf_m  = re.search(r'"confidence"\s*:\s*([0-9.]+)', raw)
+            reason_m= re.search(r'"reason"\s*:\s*"([^"]*)"', raw)
+            if label_m:
+                data = {
+                    "label"     : label_m.group(1),
+                    "confidence": float(conf_m.group(1)) if conf_m else 0.7,
+                    "reason"    : (reason_m.group(1) if reason_m else "") or "(truncated)",
+                }
+
+        if data is not None:
+            label      = str(data.get("label", "CLEAN")).upper()
+            confidence = float(data.get("confidence", 0.8))
+            reason     = data.get("reason", "") or ""
             if label not in ("CLEAN","SPAM","TOXIC","MEANINGLESS"):
                 label = "CLEAN"
-
             return label, confidence, reason
         else:
-            print(f"⚠️  KiraAI response không parse được: {raw}")
+            print(f"⚠️  KiraAI response không parse được (finish={finish_reason}): {raw!r}")
             return "CLEAN", 0.5, "Parse error → fallback"
 
     except Exception as e:
