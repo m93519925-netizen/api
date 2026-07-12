@@ -1,5 +1,8 @@
 import os, re, unicodedata, asyncio
 from contextlib import asynccontextmanager
+import gc
+gc.collect()
+torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
 import torch
 import numpy as np
@@ -41,11 +44,12 @@ async def lifespan(app: FastAPI):
     model = model.to(device)
     model.eval()
 
-    # Quantize giảm RAM ~50%
-    model = torch.quantization.quantize_dynamic(
-        model, {torch.nn.Linear}, dtype=torch.qint8
-    )
-
+  # Quantize giảm RAM ~50%
+model = torch.quantization.quantize_dynamic(
+    model, {torch.nn.Linear}, dtype=torch.qint8
+)
+gc.collect()
+print(f"✅ Model quantized & ready!")
     total = sum(p.numel() for p in model.parameters())
     print(f"✅ Model loaded! {total/1e6:.1f}M params | Device: {device}")
 
