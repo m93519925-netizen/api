@@ -2,6 +2,9 @@ import os, re, unicodedata, asyncio, gc
 from contextlib import asynccontextmanager
 
 import torch
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
 import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,24 +39,31 @@ async def lifespan(app: FastAPI):
     global tokenizer, model, device, supabase, scan_task
 
     print(f"⏳ Loading model: {MODEL_PATH}")
-    device    = torch.device("cpu")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-    model     = AutoModelForSequenceClassification.from_pretrained(
+    device = torch.device("cpu")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_PATH,
+        clean_up_tokenization_spaces=True,
+    )
+
+    model = AutoModelForSequenceClassification.from_pretrained(
         MODEL_PATH,
         ignore_mismatched_sizes=True,
+        low_cpu_mem_usage=True,
+        torch_dtype=torch.float16,
     )
     model = model.to(device)
     model.eval()
 
-    # Quantize giảm RAM ~50%
+    # Quantize INT8 giảm RAM ~50%
     model = torch.quantization.quantize_dynamic(
         model, {torch.nn.Linear}, dtype=torch.qint8
     )
+
     gc.collect()
-    print("✅ Model quantized & ready!")
 
     total = sum(p.numel() for p in model.parameters())
-    print(f"✅ Model loaded! {total/1e6:.1f}M params | Device: {device}")
+    print(f"✅ Model ready! {total/1e6:.1f}M params | Device: {device}")
 
     if SUPABASE_URL and SUPABASE_KEY:
         try:
@@ -142,6 +152,9 @@ def ml_classify(text: str, content_type: str = "question") -> tuple:
         probs   = torch.softmax(outputs.logits, dim=-1)
         pred    = torch.argmax(probs, dim=-1).item()
         conf    = probs[0][pred].item()
+
+    del inputs, outputs, probs
+    gc.collect()
 
     label = LABEL_NAMES[pred]
     if label != "CLEAN" and conf < CONFIDENCE_THR:
