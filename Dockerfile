@@ -9,8 +9,18 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Download model từ HuggingFace khi build
+RUN python -c "
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+model_id = 'dsdsdewe/hoibai-moderation-phobert'
+print('Downloading tokenizer...')
+AutoTokenizer.from_pretrained(model_id, cache_dir='./model')
+print('Downloading model...')
+AutoModelForSequenceClassification.from_pretrained(model_id, cache_dir='./model')
+print('Done!')
+"
+
 COPY main.py .
-COPY model/ ./model/
 
 EXPOSE 8000
 
