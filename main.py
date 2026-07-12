@@ -1,69 +1,57 @@
 import os, re, unicodedata, asyncio, gc
 from contextlib import asynccontextmanager
 
-import torch
-torch.set_num_threads(1)
-torch.set_num_interop_threads(1)
-
-import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-
-gc.collect()
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
+from openai import OpenAI
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MODEL_PATH     = os.getenv("MODEL_PATH",           "dsdsdewe/hoibai-moderation-phobert")
+KIRA_API_KEY   = os.getenv("KIRA_API_KEY",         "")
+KIRA_BASE_URL  = os.getenv("KIRA_BASE_URL",         "https://kiraai.vn/api/v1")
+KIRA_MODEL     = os.getenv("KIRA_MODEL",            "kira-mini-1.0")
 SUPABASE_URL   = os.getenv("SUPABASE_URL",          "")
 SUPABASE_KEY   = os.getenv("SUPABASE_SERVICE_KEY",  "")
-CONFIDENCE_THR = float(os.getenv("CONFIDENCE_THR", "0.65"))
-SCAN_INTERVAL  = int(os.getenv("SCAN_INTERVAL",    "10"))
-BATCH_SIZE     = int(os.getenv("BATCH_SIZE",       "10"))
-MAX_LENGTH     = 128
+CONFIDENCE_THR = float(os.getenv("CONFIDENCE_THR",  "0.65"))
+SCAN_INTERVAL  = int(os.getenv("SCAN_INTERVAL",     "10"))
+BATCH_SIZE     = int(os.getenv("BATCH_SIZE",        "10"))
 
-LABEL_NAMES = {0: "CLEAN", 1: "SPAM", 2: "TOXIC", 3: "MEANINGLESS"}
+LABEL_NAMES = ["CLEAN", "SPAM", "TOXIC", "MEANINGLESS"]
+
+SYSTEM_PROMPT = """Bạn là hệ thống kiểm duyệt nội dung tiếng Việt cho nền tảng hỏi đáp học sinh.
+
+Phân loại nội dung vào 1 trong 4 nhãn:
+- CLEAN: nội dung bình thường, phù hợp
+- SPAM: quảng cáo, link rác, nội dung lặp vô nghĩa
+- TOXIC: xúc phạm, tục tĩu, bắt nạt, nội dung độc hại
+- MEANINGLESS: quá ngắn, không có nghĩa, toàn ký tự lạ
+
+Trả lời ĐÚNG theo format JSON sau, không giải thích thêm:
+{"label": "CLEAN", "confidence": 0.95, "reason": ""}
+
+Trong đó:
+- label: một trong 4 nhãn trên
+- confidence: độ tin cậy từ 0.0 đến 1.0
+- reason: lý do ngắn gọn nếu không phải CLEAN, để trống nếu CLEAN"""
 
 # ── Globals ───────────────────────────────────────────────────────────────────
-tokenizer = None
-model     = None
-device    = None
-supabase  = None
-scan_task = None
+kira_client = None
+supabase    = None
+scan_task   = None
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global tokenizer, model, device, supabase, scan_task
+    global kira_client, supabase, scan_task
 
-    print(f"⏳ Loading model: {MODEL_PATH}")
-    device = torch.device("cpu")
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_PATH,
-        clean_up_tokenization_spaces=True,
-    )
-
-    model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_PATH,
-        ignore_mismatched_sizes=True,
-        low_cpu_mem_usage=True,
-        torch_dtype=torch.float16,
-    )
-    model = model.to(device)
-    model.eval()
-
-    # Quantize INT8 giảm RAM ~50%
-    model = torch.quantization.quantize_dynamic(
-        model, {torch.nn.Linear}, dtype=torch.qint8
-    )
-
-    gc.collect()
-
-    total = sum(p.numel() for p in model.parameters())
-    print(f"✅ Model ready! {total/1e6:.1f}M params | Device: {device}")
+    if not KIRA_API_KEY:
+        print("⚠️  KIRA_API_KEY chưa được set!")
+    else:
+        kira_client = OpenAI(
+            base_url=KIRA_BASE_URL,
+            api_key=KIRA_API_KEY,
+        )
+        print(f"✅ Kira AI ready! Model: {KIRA_MODEL}")
 
     if SUPABASE_URL and SUPABASE_KEY:
         try:
@@ -89,7 +77,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title    = "HoiBai ML Moderator",
-    version  = "2.0.0",
+    version  = "3.0.0",
     lifespan = lifespan,
 )
 app.add_middleware(
@@ -111,63 +99,79 @@ def clean_text(text: str) -> str:
     text = re.sub(r'\b0\d{9,10}\b', '[PHONE]', text)
     text = re.sub(r'\S+@\S+\.\S+', '[EMAIL]', text)
     text = re.sub(r'\s+', ' ', text).strip()
-    return text.lower()
+    return text
 
 
 def hard_rules(text: str) -> tuple:
     t = text.strip()
     if len(t) < 2:
-        return "MEANINGLESS", "Quá ngắn"
+        return "MEANINGLESS", 1.0, "Quá ngắn"
     if re.match(r'^(.)\1+$', t):
-        return "MEANINGLESS", "Ký tự lặp"
+        return "MEANINGLESS", 1.0, "Ký tự lặp"
     if re.match(r'^\d+$', t):
-        return "MEANINGLESS", "Toàn số"
+        return "MEANINGLESS", 1.0, "Toàn số"
     if not re.search(
         r'[a-zA-Zàáảãạăắặẳẵậâấầẩẫèéẻẽẹêếềểễệ'
         r'ìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]',
         t, re.IGNORECASE
     ):
-        return "MEANINGLESS", "Không có chữ cái"
-    return None, ""
+        return "MEANINGLESS", 1.0, "Không có chữ cái"
+    return None, 0.0, ""
 
 
-def ml_classify(text: str, content_type: str = "question") -> tuple:
-    prefix  = f"[{content_type.upper()}]"
+def kira_classify(text: str, content_type: str = "question") -> tuple:
+    if not kira_client:
+        return "CLEAN", 0.5, "Kira chưa cấu hình"
+
     cleaned = clean_text(text)
     if not cleaned:
         return "MEANINGLESS", 1.0, "Text rỗng"
 
-    combined = f"{prefix} {cleaned}"
-    inputs   = tokenizer(
-        combined,
-        return_tensors = "pt",
-        padding        = "max_length",
-        truncation     = True,
-        max_length     = MAX_LENGTH,
-    )
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    user_msg = f"[{content_type.upper()}] {cleaned}"
 
-    with torch.no_grad():
-        outputs = model(**inputs)
-        probs   = torch.softmax(outputs.logits, dim=-1)
-        pred    = torch.argmax(probs, dim=-1).item()
-        conf    = probs[0][pred].item()
+    try:
+        response = kira_client.chat.completions.create(
+            model    = KIRA_MODEL,
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": user_msg},
+            ],
+            temperature = 0.0,
+            max_tokens  = 100,
+        )
 
-    del inputs, outputs, probs
-    gc.collect()
+        raw = response.choices[0].message.content.strip()
 
-    label = LABEL_NAMES[pred]
-    if label != "CLEAN" and conf < CONFIDENCE_THR:
-        return "CLEAN", conf, f"Dưới ngưỡng {CONFIDENCE_THR:.0%}"
+        # Parse JSON từ response
+        import json
+        # Tìm JSON trong response phòng trường hợp model trả thêm text
+        match = re.search(r'\{.*?\}', raw, re.DOTALL)
+        if not match:
+            return "CLEAN", 0.5, "Parse error"
 
-    return label, round(conf, 4), ""
+        data  = json.loads(match.group())
+        label = data.get("label", "CLEAN").upper()
+        conf  = float(data.get("confidence", 0.5))
+        reason = data.get("reason", "")
+
+        if label not in LABEL_NAMES:
+            label = "CLEAN"
+
+        if label != "CLEAN" and conf < CONFIDENCE_THR:
+            return "CLEAN", conf, f"Dưới ngưỡng {CONFIDENCE_THR:.0%}"
+
+        return label, round(conf, 4), reason
+
+    except Exception as e:
+        print(f"⚠️  Kira API error: {e}")
+        return "CLEAN", 0.5, f"API error: {e}"
 
 
 def classify(text: str, content_type: str = "question") -> tuple:
-    label, reason = hard_rules(text)
+    label, conf, reason = hard_rules(text)
     if label:
-        return label, 1.0, reason
-    return ml_classify(text, content_type)
+        return label, conf, reason
+    return kira_classify(text, content_type)
 
 
 # ── Background Scanner ────────────────────────────────────────────────────────
@@ -232,7 +236,7 @@ def process_sync(itype: str, data: dict, text: str):
     try:
         label, conf, reason = classify(text, itype)
         allowed = label == "CLEAN"
-        print(f"  [{itype}] {data['id'][:8]}... → {label} ({conf:.0%})")
+        print(f"  [{itype}] {data['id'][:8]}... → {label} ({conf:.0%}) {reason}")
 
         if itype == "question":
             if allowed:
@@ -289,7 +293,7 @@ def log_violation(user_id, ref_id, ref_type, label, reason, conf):
             "ref_id"   : ref_id,
             "ref_type" : ref_type,
             "label"    : label,
-            "reason"   : reason or f"ML {conf:.0%}",
+            "reason"   : reason or f"AI {conf:.0%}",
             "action"   : "deleted",
         }).execute()
     except Exception as e:
@@ -313,11 +317,6 @@ class ModerateResponse(BaseModel):
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.post("/moderate", response_model=ModerateResponse)
 async def moderate(req: ModerateRequest):
-    if model is None:
-        return ModerateResponse(
-            label="CLEAN", confidence=0.5,
-            allowed=True, reason="Model loading..."
-        )
     loop = asyncio.get_event_loop()
     label, conf, reason = await loop.run_in_executor(
         None, lambda: classify(req.text, req.context)
@@ -368,8 +367,8 @@ async def health():
             pass
     return {
         "status"      : "ok",
-        "model_loaded": model is not None,
-        "device"      : str(device) if device else "unknown",
+        "kira_ready"  : kira_client is not None,
+        "model"       : KIRA_MODEL,
         "scanner"     : "running" if (
                             supabase and scan_task
                             and not scan_task.done()
@@ -378,7 +377,7 @@ async def health():
             "questions": pending_q,
             "answers"  : pending_a,
         },
-        "version"     : "2.0.0",
+        "version"     : "3.0.0",
     }
 
 
@@ -407,8 +406,8 @@ async def stats():
 async def root():
     return {
         "service"  : "HoiBai ML Moderator",
-        "version"  : "2.0.0",
-        "model"    : MODEL_PATH,
+        "version"  : "3.0.0",
+        "model"    : KIRA_MODEL,
         "endpoints": {
             "POST /moderate"      : "Kiểm duyệt 1 nội dung",
             "POST /moderate/batch": "Kiểm duyệt nhiều nội dung",
