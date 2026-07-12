@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from openai import OpenAI
 
 # ── Config ────────────────────────────────────────────────────────────────────
-KIRA_API_KEY   = os.getenv("KIRA_API_KEY",         "")
+KIRA_API_KEY   = os.getenv("KIRA_API_KEY",         "kira_e564cf7a91b3650799537c8bdabaed07")
 KIRA_BASE_URL  = os.getenv("KIRA_BASE_URL",         "https://kiraai.vn/api/v1")
 KIRA_MODEL     = os.getenv("KIRA_MODEL",            "kira-mini-1.0")
 SUPABASE_URL   = os.getenv("SUPABASE_URL",          "")
