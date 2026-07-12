@@ -1,8 +1,5 @@
-import os, re, unicodedata, asyncio
+import os, re, unicodedata, asyncio, gc
 from contextlib import asynccontextmanager
-import gc
-gc.collect()
-torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
 import torch
 import numpy as np
@@ -10,6 +7,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MODEL_PATH     = os.getenv("MODEL_PATH",           "dsdsdewe/hoibai-moderation-phobert")
@@ -20,7 +21,7 @@ SCAN_INTERVAL  = int(os.getenv("SCAN_INTERVAL",    "10"))
 BATCH_SIZE     = int(os.getenv("BATCH_SIZE",       "10"))
 MAX_LENGTH     = 128
 
-LABEL_NAMES = {0:"CLEAN", 1:"SPAM", 2:"TOXIC", 3:"MEANINGLESS"}
+LABEL_NAMES = {0: "CLEAN", 1: "SPAM", 2: "TOXIC", 3: "MEANINGLESS"}
 
 # ── Globals ───────────────────────────────────────────────────────────────────
 tokenizer = None
@@ -44,12 +45,13 @@ async def lifespan(app: FastAPI):
     model = model.to(device)
     model.eval()
 
-  # Quantize giảm RAM ~50%
-model = torch.quantization.quantize_dynamic(
-    model, {torch.nn.Linear}, dtype=torch.qint8
-)
-gc.collect()
-print(f"✅ Model quantized & ready!")
+    # Quantize giảm RAM ~50%
+    model = torch.quantization.quantize_dynamic(
+        model, {torch.nn.Linear}, dtype=torch.qint8
+    )
+    gc.collect()
+    print("✅ Model quantized & ready!")
+
     total = sum(p.numel() for p in model.parameters())
     print(f"✅ Model loaded! {total/1e6:.1f}M params | Device: {device}")
 
@@ -68,27 +70,39 @@ print(f"✅ Model quantized & ready!")
 
     if scan_task:
         scan_task.cancel()
-        try: await scan_task
-        except asyncio.CancelledError: pass
+        try:
+            await scan_task
+        except asyncio.CancelledError:
+            pass
     print("👋 Shutdown!")
+
 
 app = FastAPI(
     title    = "HoiBai ML Moderator",
     version  = "2.0.0",
     lifespan = lifespan,
 )
-app.add_middleware(CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def clean_text(text: str) -> str:
-    if not text: return ""
+    if not text:
+        return ""
     text = unicodedata.normalize("NFC", text)
-    text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '[URL]', text)
+    text = re.sub(
+        r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
+        '[URL]', text
+    )
     text = re.sub(r'\b0\d{9,10}\b', '[PHONE]', text)
     text = re.sub(r'\S+@\S+\.\S+', '[EMAIL]', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text.lower()
+
 
 def hard_rules(text: str) -> tuple:
     t = text.strip()
@@ -105,6 +119,7 @@ def hard_rules(text: str) -> tuple:
     ):
         return "MEANINGLESS", "Không có chữ cái"
     return None, ""
+
 
 def ml_classify(text: str, content_type: str = "question") -> tuple:
     prefix  = f"[{content_type.upper()}]"
@@ -134,10 +149,13 @@ def ml_classify(text: str, content_type: str = "question") -> tuple:
 
     return label, round(conf, 4), ""
 
+
 def classify(text: str, content_type: str = "question") -> tuple:
     label, reason = hard_rules(text)
-    if label: return label, 1.0, reason
+    if label:
+        return label, 1.0, reason
     return ml_classify(text, content_type)
+
 
 # ── Background Scanner ────────────────────────────────────────────────────────
 async def scanner_loop():
@@ -159,8 +177,10 @@ async def scanner_loop():
             print(f"❌ Scanner error: {e}")
             await asyncio.sleep(30)
 
+
 async def scan_batch() -> int:
-    if not supabase: return 0
+    if not supabase:
+        return 0
     try:
         qs  = supabase.table("questions")\
                 .select("id,title,body,user_id,points_cost")\
@@ -173,12 +193,13 @@ async def scan_batch() -> int:
 
         items = []
         for q in (qs.data or []):
-            text = f"{q['title']} {q.get('body','') or ''}"
+            text = f"{q['title']} {q.get('body', '') or ''}"
             items.append(("question", q, text))
         for a in (ans.data or []):
             items.append(("answer", a, a["body"]))
 
-        if not items: return 0
+        if not items:
+            return 0
 
         print(f"🔍 Quét {len(items)} items...")
         loop = asyncio.get_event_loop()
@@ -192,6 +213,7 @@ async def scan_batch() -> int:
     except Exception as e:
         print(f"❌ scan_batch: {e}")
         return 0
+
 
 def process_sync(itype: str, data: dict, text: str):
     try:
@@ -246,6 +268,7 @@ def process_sync(itype: str, data: dict, text: str):
     except Exception as e:
         print(f"  ❌ process error: {e}")
 
+
 def log_violation(user_id, ref_id, ref_type, label, reason, conf):
     try:
         supabase.table("moderation_logs").insert({
@@ -259,10 +282,12 @@ def log_violation(user_id, ref_id, ref_type, label, reason, conf):
     except Exception as e:
         print(f"  ⚠️  Log error: {e}")
 
+
 # ── Schemas ───────────────────────────────────────────────────────────────────
 class ModerateRequest(BaseModel):
     text   : str
     context: str = "question"
+
 
 class ModerateResponse(BaseModel):
     label     : str
@@ -270,6 +295,7 @@ class ModerateResponse(BaseModel):
     allowed   : bool
     reason    : str
     scores    : dict = {}
+
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.post("/moderate", response_model=ModerateResponse)
@@ -290,9 +316,11 @@ async def moderate(req: ModerateRequest):
         reason     = reason,
     )
 
+
 @app.post("/moderate/batch")
 async def moderate_batch(items: list[dict]):
-    if not items: return {"results": []}
+    if not items:
+        return {"results": []}
     loop    = asyncio.get_event_loop()
     results = []
     for item in items[:50]:
@@ -309,6 +337,7 @@ async def moderate_batch(items: list[dict]):
         })
     return {"results": results, "count": len(results)}
 
+
 @app.get("/health")
 async def health():
     pending_q = pending_a = 0
@@ -322,7 +351,8 @@ async def health():
                 .eq("moderation_status", "pending").execute()
             pending_q = pq.count or 0
             pending_a = pa.count or 0
-        except: pass
+        except:
+            pass
     return {
         "status"      : "ok",
         "model_loaded": model is not None,
@@ -337,6 +367,7 @@ async def health():
         },
         "version"     : "2.0.0",
     }
+
 
 @app.get("/stats")
 async def stats():
@@ -357,6 +388,7 @@ async def stats():
         }
     except Exception as e:
         return {"error": str(e)}
+
 
 @app.get("/")
 async def root():
