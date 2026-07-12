@@ -1,58 +1,46 @@
-import os, re, unicodedata, asyncio, gc
+import os, re, unicodedata, asyncio
 from contextlib import asynccontextmanager
+from openai import OpenAI
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import OpenAI
 
 # ── Config ────────────────────────────────────────────────────────────────────
-KIRA_API_KEY   = os.getenv("KIRA_API_KEY",         "kira_e564cf7a91b3650799537c8bdabaed07")
-KIRA_BASE_URL  = os.getenv("KIRA_BASE_URL",         "https://kiraai.vn/api/v1")
-KIRA_MODEL     = os.getenv("KIRA_MODEL",            "kira-mini-1.0")
-SUPABASE_URL   = os.getenv("SUPABASE_URL",          "")
-SUPABASE_KEY   = os.getenv("SUPABASE_SERVICE_KEY",  "")
-CONFIDENCE_THR = float(os.getenv("CONFIDENCE_THR",  "0.65"))
-SCAN_INTERVAL  = int(os.getenv("SCAN_INTERVAL",     "10"))
-BATCH_SIZE     = int(os.getenv("BATCH_SIZE",        "10"))
-
-LABEL_NAMES = ["CLEAN", "SPAM", "TOXIC", "MEANINGLESS"]
-
-SYSTEM_PROMPT = """Bạn là hệ thống kiểm duyệt nội dung tiếng Việt cho nền tảng hỏi đáp học sinh.
-
-Phân loại nội dung vào 1 trong 4 nhãn:
-- CLEAN: nội dung bình thường, phù hợp
-- SPAM: quảng cáo, link rác, nội dung lặp vô nghĩa
-- TOXIC: xúc phạm, tục tĩu, bắt nạt, nội dung độc hại
-- MEANINGLESS: quá ngắn, không có nghĩa, toàn ký tự lạ
-
-Trả lời ĐÚNG theo format JSON sau, không giải thích thêm:
-{"label": "CLEAN", "confidence": 0.95, "reason": ""}
-
-Trong đó:
-- label: một trong 4 nhãn trên
-- confidence: độ tin cậy từ 0.0 đến 1.0
-- reason: lý do ngắn gọn nếu không phải CLEAN, để trống nếu CLEAN"""
+KIRA_API_KEY   = os.getenv("KIRA_API_KEY",       "kira_e564cf7a91b3650799537c8bdabaed07")
+KIRA_BASE_URL  = os.getenv("KIRA_BASE_URL",       "https://kiraai.vn/api/v1")
+KIRA_MODEL     = os.getenv("KIRA_MODEL",          "kira-mini-1.0")
+SUPABASE_URL   = os.getenv("SUPABASE_URL",        "")
+SUPABASE_KEY   = os.getenv("SUPABASE_SERVICE_KEY","")
+SCAN_INTERVAL  = int(os.getenv("SCAN_INTERVAL",  "15"))
+BATCH_SIZE     = int(os.getenv("BATCH_SIZE",      "5"))
 
 # ── Globals ───────────────────────────────────────────────────────────────────
-kira_client = None
-supabase    = None
-scan_task   = None
+kira     = None
+supabase = None
+scan_task= None
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global kira_client, supabase, scan_task
+    global kira, supabase, scan_task
 
-    if not KIRA_API_KEY:
-        print("⚠️  KIRA_API_KEY chưa được set!")
-    else:
-        kira_client = OpenAI(
-            base_url=KIRA_BASE_URL,
-            api_key=KIRA_API_KEY,
+    # Khởi tạo KiraAI client
+    kira = OpenAI(base_url=KIRA_BASE_URL, api_key=KIRA_API_KEY)
+    print(f"✅ KiraAI client ready! Model: {KIRA_MODEL}")
+
+    # Test kết nối
+    try:
+        test = kira.chat.completions.create(
+            model  = KIRA_MODEL,
+            messages=[{"role":"user","content":"test"}],
+            max_tokens=5,
         )
-        print(f"✅ Kira AI ready! Model: {KIRA_MODEL}")
+        print(f"✅ KiraAI test OK: {test.choices[0].message.content}")
+    except Exception as e:
+        print(f"⚠️  KiraAI test failed: {e}")
 
+    # Kết nối Supabase
     if SUPABASE_URL and SUPABASE_KEY:
         try:
             from supabase import create_client
@@ -68,111 +56,106 @@ async def lifespan(app: FastAPI):
 
     if scan_task:
         scan_task.cancel()
-        try:
-            await scan_task
-        except asyncio.CancelledError:
-            pass
+        try: await scan_task
+        except asyncio.CancelledError: pass
     print("👋 Shutdown!")
 
-
-app = FastAPI(
-    title    = "HoiBai ML Moderator",
-    version  = "3.0.0",
-    lifespan = lifespan,
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="HoiBai ML Moderator", version="3.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware,
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def clean_text(text: str) -> str:
-    if not text:
-        return ""
+    if not text: return ""
     text = unicodedata.normalize("NFC", text)
-    text = re.sub(
-        r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
-        '[URL]', text
-    )
+    text = re.sub(r'https?://\S+', '[URL]', text)
     text = re.sub(r'\b0\d{9,10}\b', '[PHONE]', text)
-    text = re.sub(r'\S+@\S+\.\S+', '[EMAIL]', text)
     text = re.sub(r'\s+', ' ', text).strip()
-    return text
-
+    return text[:500]  # Giới hạn 500 ký tự
 
 def hard_rules(text: str) -> tuple:
+    """Rule cứng không cần AI"""
     t = text.strip()
     if len(t) < 2:
-        return "MEANINGLESS", 1.0, "Quá ngắn"
+        return "MEANINGLESS", "Quá ngắn"
     if re.match(r'^(.)\1+$', t):
-        return "MEANINGLESS", 1.0, "Ký tự lặp"
+        return "MEANINGLESS", "Ký tự lặp"
     if re.match(r'^\d+$', t):
-        return "MEANINGLESS", 1.0, "Toàn số"
+        return "MEANINGLESS", "Toàn số"
     if not re.search(
         r'[a-zA-Zàáảãạăắặẳẵậâấầẩẫèéẻẽẹêếềểễệ'
         r'ìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]',
         t, re.IGNORECASE
     ):
-        return "MEANINGLESS", 1.0, "Không có chữ cái"
-    return None, 0.0, ""
+        return "MEANINGLESS", "Không có chữ cái"
+    return None, ""
 
+SYSTEM_PROMPT = """Bạn là hệ thống kiểm duyệt nội dung cho web hỏi đáp bài tập học sinh Việt Nam lớp 1-12.
 
-def kira_classify(text: str, content_type: str = "question") -> tuple:
-    if not kira_client:
-        return "CLEAN", 0.5, "Kira chưa cấu hình"
+Phân loại nội dung vào 1 trong 4 nhãn:
+- CLEAN: Câu hỏi/trả lời bài tập hợp lệ, bình thường
+- SPAM: Quảng cáo, rao vặt, link ngoài, nội dung không liên quan học tập, câu trả lời vô dụng (lên google tìm đi, tự làm đi...)
+- TOXIC: Chửi bới, xúc phạm, đe dọa, bắt nạt, ngôn ngữ thù địch
+- MEANINGLESS: Vô nghĩa, ký tự ngẫu nhiên, không có nội dung rõ ràng
+
+Trả lời CHỈ bằng JSON format:
+{"label": "CLEAN|SPAM|TOXIC|MEANINGLESS", "confidence": 0.0-1.0, "reason": "lý do ngắn gọn"}
+
+Không giải thích thêm gì ngoài JSON."""
+
+def ai_classify(text: str, content_type: str = "question") -> tuple:
+    """Phân loại bằng KiraAI"""
+    if not kira:
+        return "CLEAN", 0.5, "KiraAI chưa sẵn sàng"
 
     cleaned = clean_text(text)
     if not cleaned:
         return "MEANINGLESS", 1.0, "Text rỗng"
 
-    user_msg = f"[{content_type.upper()}] {cleaned}"
+    user_prompt = f"Loại nội dung: {content_type}\nNội dung: {cleaned}"
 
     try:
-        response = kira_client.chat.completions.create(
+        response = kira.chat.completions.create(
             model    = KIRA_MODEL,
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": user_msg},
+                {"role": "user",   "content": user_prompt},
             ],
-            temperature = 0.0,
             max_tokens  = 100,
+            temperature = 0.1,  # Thấp để kết quả ổn định
         )
 
         raw = response.choices[0].message.content.strip()
 
-        # Parse JSON từ response
+        # Parse JSON
         import json
-        # Tìm JSON trong response phòng trường hợp model trả thêm text
-        match = re.search(r'\{.*?\}', raw, re.DOTALL)
-        if not match:
-            return "CLEAN", 0.5, "Parse error"
+        # Tìm JSON trong response
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            data       = json.loads(match.group())
+            label      = data.get("label", "CLEAN").upper()
+            confidence = float(data.get("confidence", 0.8))
+            reason     = data.get("reason", "")
 
-        data  = json.loads(match.group())
-        label = data.get("label", "CLEAN").upper()
-        conf  = float(data.get("confidence", 0.5))
-        reason = data.get("reason", "")
+            # Validate label
+            if label not in ("CLEAN","SPAM","TOXIC","MEANINGLESS"):
+                label = "CLEAN"
 
-        if label not in LABEL_NAMES:
-            label = "CLEAN"
-
-        if label != "CLEAN" and conf < CONFIDENCE_THR:
-            return "CLEAN", conf, f"Dưới ngưỡng {CONFIDENCE_THR:.0%}"
-
-        return label, round(conf, 4), reason
+            return label, confidence, reason
+        else:
+            print(f"⚠️  KiraAI response không parse được: {raw}")
+            return "CLEAN", 0.5, "Parse error → fallback"
 
     except Exception as e:
-        print(f"⚠️  Kira API error: {e}")
-        return "CLEAN", 0.5, f"API error: {e}"
-
+        print(f"❌ KiraAI error: {e}")
+        return "CLEAN", 0.5, f"API error → fallback"
 
 def classify(text: str, content_type: str = "question") -> tuple:
-    label, conf, reason = hard_rules(text)
+    """Full pipeline: hard rules → KiraAI"""
+    label, reason = hard_rules(text)
     if label:
-        return label, conf, reason
-    return kira_classify(text, content_type)
-
+        return label, 1.0, reason
+    return ai_classify(text, content_type)
 
 # ── Background Scanner ────────────────────────────────────────────────────────
 async def scanner_loop():
@@ -194,29 +177,26 @@ async def scanner_loop():
             print(f"❌ Scanner error: {e}")
             await asyncio.sleep(30)
 
-
 async def scan_batch() -> int:
-    if not supabase:
-        return 0
+    if not supabase: return 0
     try:
         qs  = supabase.table("questions")\
                 .select("id,title,body,user_id,points_cost")\
-                .eq("status", "pending")\
+                .eq("status","pending")\
                 .limit(BATCH_SIZE).execute()
         ans = supabase.table("answers")\
                 .select("id,body,user_id")\
-                .eq("moderation_status", "pending")\
+                .eq("moderation_status","pending")\
                 .limit(BATCH_SIZE).execute()
 
         items = []
         for q in (qs.data or []):
-            text = f"{q['title']} {q.get('body', '') or ''}"
+            text = f"{q['title']} {q.get('body','') or ''}"
             items.append(("question", q, text))
         for a in (ans.data or []):
             items.append(("answer", a, a["body"]))
 
-        if not items:
-            return 0
+        if not items: return 0
 
         print(f"🔍 Quét {len(items)} items...")
         loop = asyncio.get_event_loop()
@@ -231,7 +211,6 @@ async def scan_batch() -> int:
         print(f"❌ scan_batch: {e}")
         return 0
 
-
 def process_sync(itype: str, data: dict, text: str):
     try:
         label, conf, reason = classify(text, itype)
@@ -241,20 +220,19 @@ def process_sync(itype: str, data: dict, text: str):
         if itype == "question":
             if allowed:
                 supabase.table("questions")\
-                    .update({"status": "open"})\
+                    .update({"status":"open"})\
                     .eq("id", data["id"]).execute()
             else:
                 supabase.table("questions")\
                     .delete().eq("id", data["id"]).execute()
+                # Hoàn điểm
                 try:
                     p = supabase.table("profiles")\
-                        .select("points")\
-                        .eq("id", data["user_id"])\
+                        .select("points").eq("id", data["user_id"])\
                         .single().execute()
                     if p.data:
-                        new_pts = p.data["points"] + data.get("points_cost", 0)
                         supabase.table("profiles")\
-                            .update({"points": new_pts})\
+                            .update({"points": p.data["points"] + data.get("points_cost",0)})\
                             .eq("id", data["user_id"]).execute()
                         supabase.table("point_transactions").insert({
                             "user_id": data["user_id"],
@@ -264,27 +242,20 @@ def process_sync(itype: str, data: dict, text: str):
                         }).execute()
                 except Exception as e:
                     print(f"  ⚠️  Hoàn điểm lỗi: {e}")
-                log_violation(
-                    data["user_id"], data["id"],
-                    "question", label, reason, conf
-                )
+                log_violation(data["user_id"], data["id"], "question", label, reason, conf)
 
         elif itype == "answer":
             if allowed:
                 supabase.table("answers")\
-                    .update({"moderation_status": "approved"})\
+                    .update({"moderation_status":"approved"})\
                     .eq("id", data["id"]).execute()
             else:
                 supabase.table("answers")\
                     .delete().eq("id", data["id"]).execute()
-                log_violation(
-                    data["user_id"], data["id"],
-                    "answer", label, reason, conf
-                )
+                log_violation(data["user_id"], data["id"], "answer", label, reason, conf)
 
     except Exception as e:
         print(f"  ❌ process error: {e}")
-
 
 def log_violation(user_id, ref_id, ref_type, label, reason, conf):
     try:
@@ -299,12 +270,10 @@ def log_violation(user_id, ref_id, ref_type, label, reason, conf):
     except Exception as e:
         print(f"  ⚠️  Log error: {e}")
 
-
 # ── Schemas ───────────────────────────────────────────────────────────────────
 class ModerateRequest(BaseModel):
     text   : str
     context: str = "question"
-
 
 class ModerateResponse(BaseModel):
     label     : str
@@ -313,10 +282,14 @@ class ModerateResponse(BaseModel):
     reason    : str
     scores    : dict = {}
 
-
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.post("/moderate", response_model=ModerateResponse)
 async def moderate(req: ModerateRequest):
+    if not kira:
+        return ModerateResponse(
+            label="CLEAN", confidence=0.5,
+            allowed=True, reason="KiraAI chưa sẵn sàng"
+        )
     loop = asyncio.get_event_loop()
     label, conf, reason = await loop.run_in_executor(
         None, lambda: classify(req.text, req.context)
@@ -328,14 +301,12 @@ async def moderate(req: ModerateRequest):
         reason     = reason,
     )
 
-
 @app.post("/moderate/batch")
 async def moderate_batch(items: list[dict]):
-    if not items:
-        return {"results": []}
+    if not items: return {"results": []}
     loop    = asyncio.get_event_loop()
     results = []
-    for item in items[:50]:
+    for item in items[:20]:  # Giới hạn 20/batch
         text    = item.get("text", "")
         context = item.get("context", "question")
         label, conf, reason = await loop.run_in_executor(
@@ -349,7 +320,6 @@ async def moderate_batch(items: list[dict]):
         })
     return {"results": results, "count": len(results)}
 
-
 @app.get("/health")
 async def health():
     pending_q = pending_a = 0
@@ -357,29 +327,22 @@ async def health():
         try:
             pq = supabase.table("questions")\
                 .select("id", count="exact")\
-                .eq("status", "pending").execute()
+                .eq("status","pending").execute()
             pa = supabase.table("answers")\
                 .select("id", count="exact")\
-                .eq("moderation_status", "pending").execute()
+                .eq("moderation_status","pending").execute()
             pending_q = pq.count or 0
             pending_a = pa.count or 0
-        except:
-            pass
+        except: pass
     return {
         "status"      : "ok",
-        "kira_ready"  : kira_client is not None,
+        "ai_ready"    : kira is not None,
         "model"       : KIRA_MODEL,
-        "scanner"     : "running" if (
-                            supabase and scan_task
-                            and not scan_task.done()
-                        ) else "disabled",
-        "pending"     : {
-            "questions": pending_q,
-            "answers"  : pending_a,
-        },
+        "scanner"     : "running" if (supabase and scan_task
+                         and not scan_task.done()) else "disabled",
+        "pending"     : {"questions": pending_q, "answers": pending_a},
         "version"     : "3.0.0",
     }
-
 
 @app.get("/stats")
 async def stats():
@@ -391,21 +354,16 @@ async def stats():
         from collections import Counter
         return {
             "total_violations": len(logs.data or []),
-            "by_label"        : dict(Counter(
-                r["label"] for r in (logs.data or [])
-            )),
-            "by_type"         : dict(Counter(
-                r["ref_type"] for r in (logs.data or [])
-            )),
+            "by_label"        : dict(Counter(r["label"]    for r in (logs.data or []))),
+            "by_type"         : dict(Counter(r["ref_type"] for r in (logs.data or []))),
         }
     except Exception as e:
         return {"error": str(e)}
 
-
 @app.get("/")
 async def root():
     return {
-        "service"  : "HoiBai ML Moderator",
+        "service"  : "HoiBai AI Moderator",
         "version"  : "3.0.0",
         "model"    : KIRA_MODEL,
         "endpoints": {
