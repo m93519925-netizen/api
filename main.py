@@ -7,40 +7,38 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
-KIRA_API_KEY   = os.getenv("KIRA_API_KEY",       "kira_e564cf7a91b3650799537c8bdabaed07")
-KIRA_BASE_URL  = os.getenv("KIRA_BASE_URL",       "https://kiraai.vn/api/v1")
-KIRA_MODEL     = os.getenv("KIRA_MODEL",          "kira-mini-1.0")
-SUPABASE_URL   = os.getenv("SUPABASE_URL",        "")
-SUPABASE_KEY   = os.getenv("SUPABASE_SERVICE_KEY","")
-SCAN_INTERVAL  = int(os.getenv("SCAN_INTERVAL",  "15"))
-BATCH_SIZE     = int(os.getenv("BATCH_SIZE",      "5"))
+KIRA_API_KEY   = os.getenv("KIRA_API_KEY",        "")
+KIRA_BASE_URL  = os.getenv("KIRA_BASE_URL",        "https://kiraai.vn/api/v1")
+KIRA_MODEL     = os.getenv("KIRA_MODEL",           "kira-mini-1.0")
+SUPABASE_URL   = os.getenv("SUPABASE_URL",         "")
+SUPABASE_KEY   = os.getenv("SUPABASE_SERVICE_KEY", "")
+SCAN_INTERVAL  = int(os.getenv("SCAN_INTERVAL",    "15"))
+BATCH_SIZE     = int(os.getenv("BATCH_SIZE",       "5"))
 
-# ── Globals ───────────────────────────────────────────────────────────────────
-kira     = None
-supabase = None
-scan_task= None
+LABEL_NAMES = {0:"CLEAN", 1:"SPAM", 2:"TOXIC", 3:"MEANINGLESS"}
+
+kira      = None
+supabase  = None
+scan_task = None
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global kira, supabase, scan_task
 
-    # Khởi tạo KiraAI client
     kira = OpenAI(base_url=KIRA_BASE_URL, api_key=KIRA_API_KEY)
-    print(f"✅ KiraAI client ready! Model: {KIRA_MODEL}")
+    print(f"✅ KiraAI ready! Model: {KIRA_MODEL}")
 
-    # Test kết nối
     try:
         test = kira.chat.completions.create(
-            model  = KIRA_MODEL,
-            messages=[{"role":"user","content":"test"}],
-            max_tokens=5,
+            model    = KIRA_MODEL,
+            messages = [{"role":"user","content":"test"}],
+            max_tokens = 5,
         )
         print(f"✅ KiraAI test OK: {test.choices[0].message.content}")
     except Exception as e:
         print(f"⚠️  KiraAI test failed: {e}")
 
-    # Kết nối Supabase
     if SUPABASE_URL and SUPABASE_KEY:
         try:
             from supabase import create_client
@@ -60,9 +58,25 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError: pass
     print("👋 Shutdown!")
 
-app = FastAPI(title="HoiBai ML Moderator", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="HoiBai AI Moderator", version="3.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# ── System Prompt ─────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """Bạn là hệ thống kiểm duyệt nội dung cho web hỏi đáp bài tập học sinh Việt Nam lớp 1-12.
+
+Phân loại nội dung vào 1 trong 4 nhãn:
+- CLEAN: Câu hỏi/trả lời bài tập hợp lệ, liên quan đến học tập
+- SPAM: Quảng cáo, rao vặt, link ngoài, câu trả lời vô dụng (lên google đi, tự làm đi...)
+- TOXIC: Chửi bới, xúc phạm, đe dọa, bắt nạt, ngôn ngữ thù địch, nội dung người lớn, nhạy cảm về giới tính, tình dục
+- MEANINGLESS: Vô nghĩa, ký tự ngẫu nhiên, hoặc KHÔNG LIÊN QUAN học tập (hỏi về game, idol, chuyện cá nhân...)
+
+Ví dụ TOXIC: "Làm thế nào có những LGBT", nội dung 18+, chửi bới
+Ví dụ MEANINGLESS: "ai chơi liên quân không", "idol em là ai", "hôm nay ăn gì"
+Ví dụ CLEAN: bài toán, bài văn, câu hỏi lý hóa sinh sử địa anh văn...
+
+Trả lời CHỈ bằng JSON:
+{"label": "CLEAN|SPAM|TOXIC|MEANINGLESS", "confidence": 0.0-1.0, "reason": "lý do ngắn gọn"}"""
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def clean_text(text: str) -> str:
@@ -71,17 +85,13 @@ def clean_text(text: str) -> str:
     text = re.sub(r'https?://\S+', '[URL]', text)
     text = re.sub(r'\b0\d{9,10}\b', '[PHONE]', text)
     text = re.sub(r'\s+', ' ', text).strip()
-    return text[:500]  # Giới hạn 500 ký tự
+    return text[:500]
 
 def hard_rules(text: str) -> tuple:
-    """Rule cứng không cần AI"""
     t = text.strip()
-    if len(t) < 2:
-        return "MEANINGLESS", "Quá ngắn"
-    if re.match(r'^(.)\1+$', t):
-        return "MEANINGLESS", "Ký tự lặp"
-    if re.match(r'^\d+$', t):
-        return "MEANINGLESS", "Toàn số"
+    if len(t) < 2:               return "MEANINGLESS", "Quá ngắn"
+    if re.match(r'^(.)\1+$', t): return "MEANINGLESS", "Ký tự lặp"
+    if re.match(r'^\d+$', t):    return "MEANINGLESS", "Toàn số"
     if not re.search(
         r'[a-zA-Zàáảãạăắặẳẵậâấầẩẫèéẻẽẹêếềểễệ'
         r'ìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]',
@@ -90,21 +100,7 @@ def hard_rules(text: str) -> tuple:
         return "MEANINGLESS", "Không có chữ cái"
     return None, ""
 
-SYSTEM_PROMPT = """Bạn là hệ thống kiểm duyệt nội dung cho web hỏi đáp bài tập học sinh Việt Nam lớp 1-12.
-
-Phân loại nội dung vào 1 trong 4 nhãn:
-- CLEAN: Câu hỏi/trả lời bài tập hợp lệ, bình thường
-- SPAM: Quảng cáo, rao vặt, link ngoài, nội dung không liên quan học tập, câu trả lời vô dụng (lên google tìm đi, tự làm đi...)
-- TOXIC: Chửi bới, xúc phạm, đe dọa, bắt nạt, ngôn ngữ thù địch
-- MEANINGLESS: Vô nghĩa, ký tự ngẫu nhiên, không có nội dung rõ ràng
-
-Trả lời CHỈ bằng JSON format:
-{"label": "CLEAN|SPAM|TOXIC|MEANINGLESS", "confidence": 0.0-1.0, "reason": "lý do ngắn gọn"}
-
-Không giải thích thêm gì ngoài JSON."""
-
 def ai_classify(text: str, content_type: str = "question") -> tuple:
-    """Phân loại bằng KiraAI"""
     if not kira:
         return "CLEAN", 0.5, "KiraAI chưa sẵn sàng"
 
@@ -116,12 +112,12 @@ def ai_classify(text: str, content_type: str = "question") -> tuple:
 
     try:
         response = kira.chat.completions.create(
-            model    = KIRA_MODEL,
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": user_prompt},
+            model       = KIRA_MODEL,
+            messages    = [
+                {"role":"system","content":SYSTEM_PROMPT},
+                {"role":"user",  "content":user_prompt},
             ],
-            max_tokens  = 300,        # FIX: 100 quá thấp -> JSON bị cắt giữa chừng
+            max_tokens  = 300,
             temperature = 0.1,
         )
 
@@ -129,49 +125,41 @@ def ai_classify(text: str, content_type: str = "question") -> tuple:
         finish_reason= response.choices[0].finish_reason
 
         import json
-
-        # 1) Thử parse JSON đầy đủ trước
-        data = None
+        data  = None
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         if match:
-            try:
-                data = json.loads(match.group())
-            except json.JSONDecodeError:
-                data = None
+            try: data = json.loads(match.group())
+            except: data = None
 
-        # 2) Fallback: JSON bị cắt ngang (finish_reason == 'length')
-        #    Tìm thủ công từng field thay vì yêu cầu JSON hoàn chỉnh
         if data is None:
-            label_m = re.search(r'"label"\s*:\s*"([^"]+)"', raw)
-            conf_m  = re.search(r'"confidence"\s*:\s*([0-9.]+)', raw)
-            reason_m= re.search(r'"reason"\s*:\s*"([^"]*)"', raw)
+            label_m  = re.search(r'"label"\s*:\s*"([^"]+)"', raw)
+            conf_m   = re.search(r'"confidence"\s*:\s*([0-9.]+)', raw)
+            reason_m = re.search(r'"reason"\s*:\s*"([^"]*)"', raw)
             if label_m:
                 data = {
                     "label"     : label_m.group(1),
                     "confidence": float(conf_m.group(1)) if conf_m else 0.7,
-                    "reason"    : (reason_m.group(1) if reason_m else "") or "(truncated)",
+                    "reason"    : reason_m.group(1) if reason_m else "(truncated)",
                 }
 
         if data is not None:
-            label      = str(data.get("label", "CLEAN")).upper()
+            label      = str(data.get("label","CLEAN")).upper()
             confidence = float(data.get("confidence", 0.8))
-            reason     = data.get("reason", "") or ""
+            reason     = data.get("reason","") or ""
             if label not in ("CLEAN","SPAM","TOXIC","MEANINGLESS"):
                 label = "CLEAN"
             return label, confidence, reason
         else:
-            print(f"⚠️  KiraAI response không parse được (finish={finish_reason}): {raw!r}")
+            print(f"⚠️  Parse failed (finish={finish_reason}): {raw!r}")
             return "CLEAN", 0.5, "Parse error → fallback"
 
     except Exception as e:
         print(f"❌ KiraAI error: {e}")
-        return "CLEAN", 0.5, f"API error → fallback"
+        return "CLEAN", 0.5, "API error → fallback"
 
 def classify(text: str, content_type: str = "question") -> tuple:
-    """Full pipeline: hard rules → KiraAI"""
     label, reason = hard_rules(text)
-    if label:
-        return label, 1.0, reason
+    if label: return label, 1.0, reason
     return ai_classify(text, content_type)
 
 # ── Background Scanner ────────────────────────────────────────────────────────
@@ -197,21 +185,42 @@ async def scanner_loop():
 async def scan_batch() -> int:
     if not supabase: return 0
     try:
-        qs  = supabase.table("questions")\
-                .select("id,title,body,user_id,points_cost")\
-                .eq("status","pending")\
-                .limit(BATCH_SIZE).execute()
+        # Câu hỏi mới pending
+        qs_pending = supabase.table("questions")\
+            .select("id,title,body,user_id,points_cost")\
+            .eq("status","pending")\
+            .limit(BATCH_SIZE).execute()
+
+        # Câu hỏi cũ chưa scan (removed_by_ai là null)
+        qs_rescan = supabase.table("questions")\
+            .select("id,title,body,user_id,points_cost")\
+            .eq("status","open")\
+            .is_("removed_by_ai","null")\
+            .limit(BATCH_SIZE).execute()
+
+        # Answers pending
         ans = supabase.table("answers")\
-                .select("id,body,user_id")\
-                .eq("moderation_status","pending")\
-                .limit(BATCH_SIZE).execute()
+            .select("id,body,user_id")\
+            .eq("moderation_status","pending")\
+            .limit(BATCH_SIZE).execute()
+
+        # Reports cần xử lý
+        reports = supabase.table("reports")\
+            .select("id,ref_id,ref_type,reason")\
+            .eq("status","pending")\
+            .limit(BATCH_SIZE).execute()
 
         items = []
-        for q in (qs.data or []):
-            text = f"{q['title']} {q.get('body','') or ''}"
-            items.append(("question", q, text))
+        for q in (qs_pending.data or []):
+            items.append(("question_pending", q,
+                f"{q['title']} {q.get('body','') or ''}"))
+        for q in (qs_rescan.data or []):
+            items.append(("question_rescan", q,
+                f"{q['title']} {q.get('body','') or ''}"))
         for a in (ans.data or []):
             items.append(("answer", a, a["body"]))
+        for rep in (reports.data or []):
+            items.append(("report", rep, ""))
 
         if not items: return 0
 
@@ -230,49 +239,126 @@ async def scan_batch() -> int:
 
 def process_sync(itype: str, data: dict, text: str):
     try:
-        label, conf, reason = classify(text, itype)
+        # Xử lý reports riêng
+        if itype == "report":
+            _handle_report(data)
+            return
+
+        label, conf, reason = classify(text,
+            "question" if "question" in itype else "answer")
         allowed = label == "CLEAN"
         print(f"  [{itype}] {data['id'][:8]}... → {label} ({conf:.0%}) {reason}")
 
-        if itype == "question":
+        if "question" in itype:
             if allowed:
+                update_data = {"removed_by_ai": False}
+                if itype == "question_pending":
+                    update_data["status"] = "open"
                 supabase.table("questions")\
-                    .update({"status":"open"})\
+                    .update(update_data)\
                     .eq("id", data["id"]).execute()
             else:
-                supabase.table("questions")\
-                    .delete().eq("id", data["id"]).execute()
-                # Hoàn điểm
-                try:
-                    p = supabase.table("profiles")\
-                        .select("points").eq("id", data["user_id"])\
-                        .single().execute()
-                    if p.data:
-                        supabase.table("profiles")\
-                            .update({"points": p.data["points"] + data.get("points_cost",0)})\
-                            .eq("id", data["user_id"]).execute()
-                        supabase.table("point_transactions").insert({
-                            "user_id": data["user_id"],
-                            "amount" : data.get("points_cost", 0),
-                            "reason" : "refund_violation",
-                            "ref_id" : data["id"],
-                        }).execute()
-                except Exception as e:
-                    print(f"  ⚠️  Hoàn điểm lỗi: {e}")
-                log_violation(data["user_id"], data["id"], "question", label, reason, conf)
+                supabase.table("questions").update({
+                    "status"         : "removed",
+                    "removed_by_ai"  : True,
+                    "removed_reason" : reason or label,
+                    "removed_content": text[:1000],
+                }).eq("id", data["id"]).execute()
+
+                if itype == "question_pending":
+                    _refund_points(data)
+
+                log_violation(data["user_id"], data["id"],
+                              "question", label, reason, conf)
+                print(f"  🚫 Removed question {data['id'][:8]} → {label}")
 
         elif itype == "answer":
             if allowed:
-                supabase.table("answers")\
-                    .update({"moderation_status":"approved"})\
-                    .eq("id", data["id"]).execute()
+                supabase.table("answers").update({
+                    "moderation_status": "approved",
+                    "removed_by_ai"    : False,
+                }).eq("id", data["id"]).execute()
             else:
-                supabase.table("answers")\
-                    .delete().eq("id", data["id"]).execute()
-                log_violation(data["user_id"], data["id"], "answer", label, reason, conf)
+                supabase.table("answers").update({
+                    "moderation_status": "removed",
+                    "removed_by_ai"    : True,
+                    "removed_reason"   : reason or label,
+                    "removed_content"  : text[:1000],
+                }).eq("id", data["id"]).execute()
+                log_violation(data["user_id"], data["id"],
+                              "answer", label, reason, conf)
+                print(f"  🚫 Removed answer {data['id'][:8]} → {label}")
 
     except Exception as e:
         print(f"  ❌ process error: {e}")
+
+def _refund_points(q: dict):
+    try:
+        p = supabase.table("profiles")\
+            .select("points").eq("id", q["user_id"])\
+            .single().execute()
+        if p.data:
+            supabase.table("profiles")\
+                .update({"points": p.data["points"] + q.get("points_cost",0)})\
+                .eq("id", q["user_id"]).execute()
+            supabase.table("point_transactions").insert({
+                "user_id": q["user_id"],
+                "amount" : q.get("points_cost", 0),
+                "reason" : "refund_violation",
+                "ref_id" : q["id"],
+            }).execute()
+    except Exception as e:
+        print(f"  ⚠️  Refund error: {e}")
+
+def _handle_report(report: dict):
+    """Xử lý báo cáo từ user — scan lại nội dung bị báo cáo"""
+    try:
+        ref_id   = report["ref_id"]
+        ref_type = report["ref_type"]
+
+        if ref_type == "question":
+            r = supabase.table("questions")\
+                .select("id,title,body,user_id,points_cost")\
+                .eq("id", ref_id).single().execute()
+            if r.data:
+                text  = f"{r.data['title']} {r.data.get('body','') or ''}"
+                label, conf, reason = classify(text, "question")
+                if label != "CLEAN":
+                    supabase.table("questions").update({
+                        "status"         : "removed",
+                        "removed_by_ai"  : True,
+                        "removed_reason" : f"Report: {reason or label}",
+                        "removed_content": text[:1000],
+                    }).eq("id", ref_id).execute()
+                    _refund_points(r.data)
+                    log_violation(r.data["user_id"], ref_id,
+                                  "question", label, reason, conf)
+                    print(f"  🚩 Report → removed question {ref_id[:8]}")
+
+        elif ref_type == "answer":
+            r = supabase.table("answers")\
+                .select("id,body,user_id")\
+                .eq("id", ref_id).single().execute()
+            if r.data:
+                label, conf, reason = classify(r.data["body"], "answer")
+                if label != "CLEAN":
+                    supabase.table("answers").update({
+                        "moderation_status": "removed",
+                        "removed_by_ai"    : True,
+                        "removed_reason"   : f"Report: {reason or label}",
+                        "removed_content"  : r.data["body"][:1000],
+                    }).eq("id", ref_id).execute()
+                    log_violation(r.data["user_id"], ref_id,
+                                  "answer", label, reason, conf)
+                    print(f"  🚩 Report → removed answer {ref_id[:8]}")
+
+        # Đánh dấu report đã xử lý
+        supabase.table("reports")\
+            .update({"status": "resolved"})\
+            .eq("id", report["id"]).execute()
+
+    except Exception as e:
+        print(f"  ⚠️  Handle report error: {e}")
 
 def log_violation(user_id, ref_id, ref_type, label, reason, conf):
     try:
@@ -312,10 +398,8 @@ async def moderate(req: ModerateRequest):
         None, lambda: classify(req.text, req.context)
     )
     return ModerateResponse(
-        label      = label,
-        confidence = conf,
-        allowed    = label == "CLEAN",
-        reason     = reason,
+        label=label, confidence=conf,
+        allowed=(label=="CLEAN"), reason=reason,
     )
 
 @app.post("/moderate/batch")
@@ -323,7 +407,7 @@ async def moderate_batch(items: list[dict]):
     if not items: return {"results": []}
     loop    = asyncio.get_event_loop()
     results = []
-    for item in items[:20]:  # Giới hạn 20/batch
+    for item in items[:20]:
         text    = item.get("text", "")
         context = item.get("context", "question")
         label, conf, reason = await loop.run_in_executor(
@@ -339,7 +423,7 @@ async def moderate_batch(items: list[dict]):
 
 @app.get("/health")
 async def health():
-    pending_q = pending_a = 0
+    pending_q = pending_a = pending_r = 0
     if supabase:
         try:
             pq = supabase.table("questions")\
@@ -348,17 +432,25 @@ async def health():
             pa = supabase.table("answers")\
                 .select("id", count="exact")\
                 .eq("moderation_status","pending").execute()
+            pr = supabase.table("reports")\
+                .select("id", count="exact")\
+                .eq("status","pending").execute()
             pending_q = pq.count or 0
             pending_a = pa.count or 0
+            pending_r = pr.count or 0
         except: pass
     return {
-        "status"      : "ok",
-        "ai_ready"    : kira is not None,
-        "model"       : KIRA_MODEL,
-        "scanner"     : "running" if (supabase and scan_task
-                         and not scan_task.done()) else "disabled",
-        "pending"     : {"questions": pending_q, "answers": pending_a},
-        "version"     : "3.0.0",
+        "status"   : "ok",
+        "ai_ready" : kira is not None,
+        "model"    : KIRA_MODEL,
+        "scanner"  : "running" if (supabase and scan_task
+                      and not scan_task.done()) else "disabled",
+        "pending"  : {
+            "questions": pending_q,
+            "answers"  : pending_a,
+            "reports"  : pending_r,
+        },
+        "version"  : "3.0.0",
     }
 
 @app.get("/stats")
@@ -368,11 +460,22 @@ async def stats():
     try:
         logs = supabase.table("moderation_logs")\
             .select("label,ref_type").execute()
+        rpts = supabase.table("reports")\
+            .select("status,reason").execute()
         from collections import Counter
         return {
             "total_violations": len(logs.data or []),
-            "by_label"        : dict(Counter(r["label"]    for r in (logs.data or []))),
-            "by_type"         : dict(Counter(r["ref_type"] for r in (logs.data or []))),
+            "by_label"        : dict(Counter(
+                r["label"] for r in (logs.data or []))),
+            "by_type"         : dict(Counter(
+                r["ref_type"] for r in (logs.data or []))),
+            "reports"         : {
+                "total"   : len(rpts.data or []),
+                "by_status": dict(Counter(
+                    r["status"] for r in (rpts.data or []))),
+                "by_reason": dict(Counter(
+                    r["reason"] for r in (rpts.data or []))),
+            },
         }
     except Exception as e:
         return {"error": str(e)}
