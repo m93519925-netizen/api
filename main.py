@@ -232,7 +232,7 @@ Lý do kháng cáo của người dùng: {appeal_content[:300]}"""
             if "approv" in decision or "chấp" in decision:
                 decision = "approved"
             else:
-                decision = "approved"  # Fallback về approved
+                decision = "approved"
 
         if not reason:
             reason = "Đã xem xét kháng cáo" if decision == "approved" \
@@ -316,7 +316,7 @@ async def scan_batch():
             .eq("status","pending")\
             .limit(BATCH_SIZE).execute()
 
-        # 6. Reports pending — thêm reporter_id
+        # 6. Reports pending
         reports = supabase.table("reports")\
             .select("id,ref_id,ref_type,reason,reporter_id")\
             .eq("status","pending")\
@@ -555,6 +555,9 @@ def _handle_report(report: dict):
         reporter_id = report.get("reporter_id")
 
         action_taken = False
+        label  = "CLEAN"
+        conf   = 0.0
+        reason = ""
 
         if ref_type == "question":
             r = supabase.table("questions")\
@@ -638,8 +641,9 @@ def _handle_report(report: dict):
                     user_id  = reporter_id,
                     ntype    = "report_resolved",
                     title    = "ℹ️ Báo cáo của bạn đã được xem xét",
-                    message  = "Chúng tôi đã xem xét nội dung bị báo cáo nhưng không phát hiện vi phạm. "
-                               "Cảm ơn bạn đã đóng góp cho cộng đồng!",
+                    message  = f'Chúng tôi đã xem xét nội dung bị báo cáo nhưng không phát hiện vi phạm. '
+                               f'Lý do: AI phân loại là "{label}" ({conf:.0%} độ chắc chắn) — {reason or "không có lý do cụ thể"}. '
+                               f'Cảm ơn bạn đã đóng góp cho cộng đồng!',
                     ref_id   = ref_id,
                     ref_type = ref_type,
                 )
