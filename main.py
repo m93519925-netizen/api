@@ -76,17 +76,23 @@ Ví dụ CLEAN: bài toán, bài văn, câu hỏi lý hóa sinh sử địa anh 
 Trả lời CHỈ bằng JSON:
 {"label": "CLEAN|SPAM|TOXIC|MEANINGLESS", "confidence": 0.0-1.0, "reason": "lý do ngắn gọn bằng tiếng Việt"}"""
 
-APPEAL_PROMPT = """Bạn là hệ thống xét duyệt kháng cáo cho web hỏi đáp bài tập học sinh Việt Nam.
+# ── Appeal Prompt (updated) ───────────────────────────────────────────────────
+APPEAL_PROMPT = """Bạn là hệ thống xét duyệt kháng cáo cho web hỏi đáp bài tập học sinh Việt Nam lớp 1-12.
 
-Một nội dung đã bị AI xóa. Người dùng đã gửi kháng cáo giải thích tại sao nội dung của họ không vi phạm.
+Xem xét kháng cáo và trả lời NGAY LẬP TỨC bằng JSON, không giải thích thêm:
 
-Hãy xem xét:
-1. Nội dung gốc có thực sự vi phạm không?
-2. Lý do kháng cáo có hợp lý không?
-3. AI có nhận dạng sai không?
+Nếu kháng cáo hợp lệ (AI xóa nhầm):
+{"decision": "approved", "confidence": 0.8, "reason": "lý do ngắn gọn tiếng Việt"}
 
-Trả lời CHỈ bằng JSON:
-{"decision": "approved|rejected", "confidence": 0.0-1.0, "reason": "lý do quyết định bằng tiếng Việt"}"""
+Nếu kháng cáo không hợp lệ (AI xóa đúng):
+{"decision": "rejected", "confidence": 0.8, "reason": "lý do ngắn gọn tiếng Việt"}
+
+Nguyên tắc xét duyệt:
+- Bài tập học thuật, nghị luận xã hội, câu hỏi SGK → APPROVED
+- Chửi bới, spam, nội dung 18+, không liên quan học tập → REJECTED
+- Nếu không chắc chắn → APPROVED (tránh oan user)
+
+CHỈ trả về JSON, không có text khác."""
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def clean_text(text: str) -> str:
@@ -176,23 +182,68 @@ Lý do kháng cáo của người dùng: {appeal_content[:300]}"""
             temperature = 0.1,
         )
         raw = response.choices[0].message.content.strip()
+        print(f"  ⚖️  Appeal raw response: {raw!r}")
+
         import json
-        data  = None
-        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        data = None
+
+        # Cách 1: tìm JSON trong response
+        match = re.search(r'\{.*?\}', raw, re.DOTALL)
         if match:
-            try: data = json.loads(match.group())
-            except: pass
-        if data:
-            decision = str(data.get("decision","rejected")).lower()
-            conf     = float(data.get("confidence", 0.7))
-            reason   = data.get("reason","") or ""
-            if decision not in ("approved","rejected"):
-                decision = "rejected"
-            return decision, conf, reason
-        return "rejected", 0.5, "Parse error"
+            try:
+                data = json.loads(match.group())
+            except:
+                pass
+
+        # Cách 2: parse từng field bằng regex
+        if data is None:
+            dm = re.search(r'"decision"\s*:\s*"([^"]+)"', raw, re.IGNORECASE)
+            cm = re.search(r'"confidence"\s*:\s*([0-9.]+)', raw)
+            rm = re.search(r'"reason"\s*:\s*"([^"]*)"', raw)
+            if dm:
+                data = {
+                    "decision"  : dm.group(1),
+                    "confidence": float(cm.group(1)) if cm else 0.7,
+                    "reason"    : rm.group(1) if rm else "",
+                }
+
+        # Cách 3: tìm từ khóa trong text thuần
+        if data is None:
+            raw_lower = raw.lower()
+            if any(w in raw_lower for w in ["approved","chấp nhận","hợp lệ","đồng ý","khôi phục"]):
+                reason_text = raw[:200] if raw else "Kháng cáo hợp lệ"
+                data = {"decision":"approved","confidence":0.7,"reason":reason_text}
+            elif any(w in raw_lower for w in ["rejected","từ chối","không hợp lệ","vi phạm"]):
+                reason_text = raw[:200] if raw else "Nội dung vi phạm"
+                data = {"decision":"rejected","confidence":0.7,"reason":reason_text}
+
+        # Cách 4: fallback cuối — approved để tránh oan user
+        if data is None:
+            print(f"  ⚠️  Appeal parse failed hoàn toàn → fallback approved")
+            return "approved", 0.5, \
+                "Hệ thống không thể xử lý tự động. Kháng cáo được chấp nhận để tránh nhầm lẫn."
+
+        # Validate & chuẩn hóa
+        decision = str(data.get("decision","approved")).lower().strip()
+        conf     = float(data.get("confidence", 0.7))
+        reason   = str(data.get("reason","")).strip()
+
+        if decision not in ("approved","rejected"):
+            if "approv" in decision or "chấp" in decision:
+                decision = "approved"
+            else:
+                decision = "approved"  # Fallback về approved
+
+        if not reason:
+            reason = "Đã xem xét kháng cáo" if decision == "approved" \
+                     else "Nội dung vẫn vi phạm quy tắc"
+
+        return decision, conf, reason
+
     except Exception as e:
         print(f"❌ Appeal review error: {e}")
-        return "rejected", 0.5, "API error"
+        return "approved", 0.5, \
+            "Lỗi hệ thống khi xử lý kháng cáo. Tự động chấp nhận để đảm bảo quyền lợi."
 
 def classify(text: str, content_type: str = "question") -> tuple:
     label, reason = hard_rules(text)
@@ -233,39 +284,33 @@ async def scan_batch():
     if not supabase: return
 
     try:
-        # 1. Câu hỏi pending
         qs_pending = supabase.table("questions")\
             .select("id,title,body,user_id,points_cost")\
             .eq("status","pending")\
             .limit(BATCH_SIZE).execute()
 
-        # 2. Câu hỏi open chưa scan (removed_by_ai là null)
         qs_rescan = supabase.table("questions")\
             .select("id,title,body,user_id,points_cost")\
             .eq("status","open")\
             .is_("removed_by_ai","null")\
             .limit(BATCH_SIZE).execute()
 
-        # 3. Answers pending
         ans_pending = supabase.table("answers")\
             .select("id,body,user_id,question_id")\
             .eq("moderation_status","pending")\
             .limit(BATCH_SIZE).execute()
 
-        # 4. Answers chưa scan
         ans_rescan = supabase.table("answers")\
             .select("id,body,user_id,question_id")\
             .eq("moderation_status","approved")\
             .is_("removed_by_ai","null")\
             .limit(BATCH_SIZE).execute()
 
-        # 5. Kháng cáo pending
         appeals = supabase.table("appeals")\
             .select("id,user_id,ref_id,ref_type,content")\
             .eq("status","pending")\
             .limit(BATCH_SIZE).execute()
 
-        # 6. Reports pending
         reports = supabase.table("reports")\
             .select("id,ref_id,ref_type,reason")\
             .eq("status","pending")\
@@ -300,7 +345,6 @@ def process_item(itype: str, data: dict):
             _handle_report(data)
             return
 
-        # Classify content
         if "q_" in itype:
             text = f"{data['title']} {data.get('body','') or ''}"
             ctype = "question"
@@ -329,7 +373,6 @@ def _handle_question_result(q, itype, label, allowed, reason, conf):
         supabase.table("questions")\
             .update(update).eq("id", q["id"]).execute()
     else:
-        # Lưu nội dung + đánh dấu removed
         text = f"{q['title']} {q.get('body','') or ''}"
         supabase.table("questions").update({
             "status"         : "removed",
@@ -338,14 +381,11 @@ def _handle_question_result(q, itype, label, allowed, reason, conf):
             "removed_content": text[:1000],
         }).eq("id", q["id"]).execute()
 
-        # Hoàn điểm nếu pending
         if itype == "q_pending":
             _refund_points(q["user_id"], q.get("points_cost", 0), q["id"])
 
-        # Ghi log
         _log_violation(q["user_id"], q["id"], "question", label, reason, conf)
 
-        # Thông báo cho user
         label_vi = {
             "SPAM"       : "Spam/Quảng cáo",
             "TOXIC"      : "Nội dung không phù hợp",
@@ -368,7 +408,6 @@ def _handle_answer_result(a, itype, label, allowed, reason, conf):
         update = {"removed_by_ai": False}
         if itype == "a_pending":
             update["moderation_status"] = "approved"
-            # Thông báo cho chủ câu hỏi có câu trả lời mới
             _notify_new_answer(a)
         supabase.table("answers")\
             .update(update).eq("id", a["id"]).execute()
@@ -401,7 +440,6 @@ def _handle_answer_result(a, itype, label, allowed, reason, conf):
         print(f"  🚫 Removed answer {a['id'][:8]} → {label}")
 
 def _notify_new_answer(answer: dict):
-    """Thông báo chủ câu hỏi có câu trả lời mới"""
     try:
         q = supabase.table("questions")\
             .select("id,title,user_id")\
@@ -425,7 +463,6 @@ def _handle_appeal(appeal: dict):
         ref_id   = appeal["ref_id"]
         ref_type = appeal["ref_type"]
 
-        # Lấy nội dung gốc
         if ref_type == "question":
             r = supabase.table("questions")\
                 .select("id,title,body,user_id,points_cost,removed_reason,removed_content")\
@@ -446,7 +483,6 @@ def _handle_appeal(appeal: dict):
                    (f"{item.get('title','')} {item.get('body','')}" if ref_type=="question"
                     else item.get("body",""))
 
-        # AI xét duyệt
         decision, conf, reason = ai_review_appeal(
             original_content = original,
             removed_reason   = item.get("removed_reason",""),
@@ -456,7 +492,6 @@ def _handle_appeal(appeal: dict):
 
         print(f"  ⚖️  Appeal {appeal['id'][:8]} → {decision} ({conf:.0%}) {reason}")
 
-        # Cập nhật appeal
         from datetime import datetime, timezone
         supabase.table("appeals").update({
             "status"     : decision,
@@ -465,7 +500,6 @@ def _handle_appeal(appeal: dict):
         }).eq("id", appeal["id"]).execute()
 
         if decision == "approved":
-            # Khôi phục nội dung
             if ref_type == "question":
                 supabase.table("questions").update({
                     "status"        : "open",
@@ -473,10 +507,8 @@ def _handle_appeal(appeal: dict):
                     "removed_reason": None,
                 }).eq("id", ref_id).execute()
 
-                # Hoàn điểm nếu đã trừ
                 if item.get("points_cost"):
-                    _refund_points(item["user_id"],
-                                   item["points_cost"], ref_id)
+                    _refund_points(item["user_id"], item["points_cost"], ref_id)
             else:
                 supabase.table("answers").update({
                     "moderation_status": "approved",
@@ -484,7 +516,6 @@ def _handle_appeal(appeal: dict):
                     "removed_reason"   : None,
                 }).eq("id", ref_id).execute()
 
-            # Thông báo thành công
             send_notification(
                 user_id   = appeal["user_id"],
                 ntype     = "appeal_approved",
@@ -496,7 +527,6 @@ def _handle_appeal(appeal: dict):
                 appeal_id = appeal["id"],
             )
         else:
-            # Thông báo thất bại
             send_notification(
                 user_id   = appeal["user_id"],
                 ntype     = "appeal_rejected",
@@ -512,7 +542,6 @@ def _handle_appeal(appeal: dict):
         print(f"  ❌ Appeal error: {e}")
 
 def _handle_report(report: dict):
-    """Xử lý báo cáo từ user"""
     try:
         ref_id   = report["ref_id"]
         ref_type = report["ref_type"]
@@ -649,7 +678,7 @@ async def health():
                 ("questions",  {"status"           : "pending"}),
                 ("answers",    {"moderation_status": "pending"}),
                 ("appeals",    {"status"           : "pending"}),
-                ("reports",    {"status"           : "pending"}),
+                ("reports",    {"status"             : "pending"}),
             ]:
                 key, val = list(flt.items())[0]
                 r = supabase.table(tbl)\
