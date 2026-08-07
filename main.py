@@ -76,7 +76,7 @@ Ví dụ CLEAN: bài toán, bài văn, câu hỏi lý hóa sinh sử địa anh 
 Trả lời CHỈ bằng JSON:
 {"label": "CLEAN|SPAM|TOXIC|MEANINGLESS", "confidence": 0.0-1.0, "reason": "lý do ngắn gọn bằng tiếng Việt"}"""
 
-# ── Appeal Prompt (updated) ───────────────────────────────────────────────────
+# ── Appeal Prompt ─────────────────────────────────────────────────────────────
 APPEAL_PROMPT = """Bạn là hệ thống xét duyệt kháng cáo cho web hỏi đáp bài tập học sinh Việt Nam lớp 1-12.
 
 Xem xét kháng cáo và trả lời NGAY LẬP TỨC bằng JSON, không giải thích thêm:
@@ -284,45 +284,51 @@ async def scan_batch():
     if not supabase: return
 
     try:
+        # 1. Câu hỏi pending
         qs_pending = supabase.table("questions")\
             .select("id,title,body,user_id,points_cost")\
             .eq("status","pending")\
             .limit(BATCH_SIZE).execute()
 
+        # 2. Câu hỏi open chưa scan
         qs_rescan = supabase.table("questions")\
             .select("id,title,body,user_id,points_cost")\
             .eq("status","open")\
             .is_("removed_by_ai","null")\
             .limit(BATCH_SIZE).execute()
 
+        # 3. Answers pending
         ans_pending = supabase.table("answers")\
             .select("id,body,user_id,question_id")\
             .eq("moderation_status","pending")\
             .limit(BATCH_SIZE).execute()
 
+        # 4. Answers chưa scan
         ans_rescan = supabase.table("answers")\
             .select("id,body,user_id,question_id")\
             .eq("moderation_status","approved")\
             .is_("removed_by_ai","null")\
             .limit(BATCH_SIZE).execute()
 
+        # 5. Kháng cáo pending
         appeals = supabase.table("appeals")\
             .select("id,user_id,ref_id,ref_type,content")\
             .eq("status","pending")\
             .limit(BATCH_SIZE).execute()
 
+        # 6. Reports pending — thêm reporter_id
         reports = supabase.table("reports")\
-            .select("id,ref_id,ref_type,reason")\
+            .select("id,ref_id,ref_type,reason,reporter_id")\
             .eq("status","pending")\
             .limit(BATCH_SIZE).execute()
 
         items = []
-        for q in (qs_pending.data  or []): items.append(("q_pending", q))
-        for q in (qs_rescan.data   or []): items.append(("q_rescan",  q))
-        for a in (ans_pending.data or []): items.append(("a_pending", a))
-        for a in (ans_rescan.data  or []): items.append(("a_rescan",  a))
-        for ap in (appeals.data    or []): items.append(("appeal",    ap))
-        for r  in (reports.data    or []): items.append(("report",    r))
+        for q  in (qs_pending.data  or []): items.append(("q_pending", q))
+        for q  in (qs_rescan.data   or []): items.append(("q_rescan",  q))
+        for a  in (ans_pending.data or []): items.append(("a_pending", a))
+        for a  in (ans_rescan.data  or []): items.append(("a_rescan",  a))
+        for ap in (appeals.data     or []): items.append(("appeal",    ap))
+        for r  in (reports.data     or []): items.append(("report",    r))
 
         if items:
             print(f"🔍 Quét {len(items)} items...")
@@ -346,7 +352,7 @@ def process_item(itype: str, data: dict):
             return
 
         if "q_" in itype:
-            text = f"{data['title']} {data.get('body','') or ''}"
+            text  = f"{data['title']} {data.get('body','') or ''}"
             ctype = "question"
         else:
             text  = data["body"]
@@ -440,6 +446,7 @@ def _handle_answer_result(a, itype, label, allowed, reason, conf):
         print(f"  🚫 Removed answer {a['id'][:8]} → {label}")
 
 def _notify_new_answer(answer: dict):
+    """Thông báo chủ câu hỏi có câu trả lời mới"""
     try:
         q = supabase.table("questions")\
             .select("id,title,user_id")\
@@ -506,7 +513,6 @@ def _handle_appeal(appeal: dict):
                     "removed_by_ai" : False,
                     "removed_reason": None,
                 }).eq("id", ref_id).execute()
-
                 if item.get("points_cost"):
                     _refund_points(item["user_id"], item["points_cost"], ref_id)
             else:
@@ -542,9 +548,13 @@ def _handle_appeal(appeal: dict):
         print(f"  ❌ Appeal error: {e}")
 
 def _handle_report(report: dict):
+    """Xử lý báo cáo từ user"""
     try:
-        ref_id   = report["ref_id"]
-        ref_type = report["ref_type"]
+        ref_id      = report["ref_id"]
+        ref_type    = report["ref_type"]
+        reporter_id = report.get("reporter_id")
+
+        action_taken = False
 
         if ref_type == "question":
             r = supabase.table("questions")\
@@ -561,7 +571,7 @@ def _handle_report(report: dict):
                         "removed_content": text[:1000],
                     }).eq("id", ref_id).execute()
                     _refund_points(r.data["user_id"],
-                                   r.data.get("points_cost",0), ref_id)
+                                   r.data.get("points_cost", 0), ref_id)
                     _log_violation(r.data["user_id"], ref_id,
                                    "question", label, reason, conf)
                     send_notification(
@@ -569,11 +579,14 @@ def _handle_report(report: dict):
                         ntype    = "content_removed",
                         title    = "⚠️ Câu hỏi bị xóa sau khi bị báo cáo",
                         message  = f'Câu hỏi của bạn bị xóa sau khi người dùng báo cáo. '
-                                  f'Lý do: {reason}. Bạn có thể kháng cáo.',
+                                   f'Lý do: {reason}. Bạn có thể kháng cáo.',
                         ref_id   = ref_id,
                         ref_type = "question",
                     )
+                    action_taken = True
                     print(f"  🚩 Report → removed question {ref_id[:8]}")
+                else:
+                    print(f"  🚩 Report → question {ref_id[:8]} CLEAN, không xóa")
 
         elif ref_type == "answer":
             r = supabase.table("answers")\
@@ -595,15 +608,41 @@ def _handle_report(report: dict):
                         ntype    = "content_removed",
                         title    = "⚠️ Câu trả lời bị xóa sau khi bị báo cáo",
                         message  = f'Câu trả lời của bạn bị xóa sau khi người dùng báo cáo. '
-                                  f'Lý do: {reason}. Bạn có thể kháng cáo.',
+                                   f'Lý do: {reason}. Bạn có thể kháng cáo.',
                         ref_id   = ref_id,
                         ref_type = "answer",
                     )
+                    action_taken = True
                     print(f"  🚩 Report → removed answer {ref_id[:8]}")
+                else:
+                    print(f"  🚩 Report → answer {ref_id[:8]} CLEAN, không xóa")
 
+        # Cập nhật status report → resolved
         supabase.table("reports")\
-            .update({"status":"resolved"})\
+            .update({"status": "resolved"})\
             .eq("id", report["id"]).execute()
+
+        # Thông báo cho người báo cáo
+        if reporter_id:
+            if action_taken:
+                send_notification(
+                    user_id  = reporter_id,
+                    ntype    = "report_resolved",
+                    title    = "✅ Báo cáo của bạn đã được xử lý",
+                    message  = "Cảm ơn bạn đã báo cáo! Nội dung vi phạm đã được xóa khỏi hệ thống.",
+                    ref_id   = ref_id,
+                    ref_type = ref_type,
+                )
+            else:
+                send_notification(
+                    user_id  = reporter_id,
+                    ntype    = "report_resolved",
+                    title    = "ℹ️ Báo cáo của bạn đã được xem xét",
+                    message  = "Chúng tôi đã xem xét nội dung bị báo cáo nhưng không phát hiện vi phạm. "
+                               "Cảm ơn bạn đã đóng góp cho cộng đồng!",
+                    ref_id   = ref_id,
+                    ref_type = ref_type,
+                )
 
     except Exception as e:
         print(f"  ❌ Report error: {e}")
@@ -678,7 +717,7 @@ async def health():
                 ("questions",  {"status"           : "pending"}),
                 ("answers",    {"moderation_status": "pending"}),
                 ("appeals",    {"status"           : "pending"}),
-                ("reports",    {"status"             : "pending"}),
+                ("reports",    {"status"           : "pending"}),
             ]:
                 key, val = list(flt.items())[0]
                 r = supabase.table(tbl)\
