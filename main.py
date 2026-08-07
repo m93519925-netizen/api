@@ -8,8 +8,8 @@ from pydantic import BaseModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
 KIRA_API_KEY   = os.getenv("KIRA_API_KEY",        "")
-KIRA_BASE_URL  = os.getenv("KIRA_BASE_URL",        "https://openrouter.ai/api/v1/chat/completions")
-KIRA_MODEL     = os.getenv("KIRA_MODEL",           "google/gemma-4-26b-a4b-it:free")
+KIRA_BASE_URL  = os.getenv("KIRA_BASE_URL",        "https://llm.thesparkdaily.com/v1")
+KIRA_MODEL     = os.getenv("KIRA_MODEL",           "deepseek-v4-flash")
 SUPABASE_URL   = os.getenv("SUPABASE_URL",         "")
 SUPABASE_KEY   = os.getenv("SUPABASE_SERVICE_KEY", "")
 SCAN_INTERVAL  = int(os.getenv("SCAN_INTERVAL",    "30"))
