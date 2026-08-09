@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from collections import Counter
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -139,6 +140,28 @@ MCP_TOOLS = [
                 "ref_type": {"type":"string","description":"'question' hoặc 'answer'"},
             },
             "required": ["ref_id","ref_type"],
+        },
+    },
+    {
+        "name"       : "get_image",
+        "description": "Tải ảnh từ URL và trả về base64 để admin xem nội dung ảnh đính kèm, phát hiện vi phạm trong ảnh",
+        "inputSchema": {
+            "type"      : "object",
+            "properties": {
+                "image_url": {"type":"string","description":"URL của ảnh cần xem"},
+            },
+            "required": ["image_url"],
+        },
+    },
+    {
+        "name"       : "get_question_by_answer_id",
+        "description": "Lấy thông tin câu hỏi cha từ ID của một câu trả lời — dùng khi cần xem ngữ cảnh hoặc xóa câu hỏi liên quan",
+        "inputSchema": {
+            "type"      : "object",
+            "properties": {
+                "answer_id": {"type":"string","description":"ID của câu trả lời"},
+            },
+            "required": ["answer_id"],
         },
     },
     {
@@ -320,6 +343,67 @@ def execute_tool(tool: str, inp: dict) -> str:
                 f"📊 {a.get('moderation_status','')} | 🚩 {a.get('removed_reason') or '(chưa gắn cờ)'}\n"
                 f"🕐 {a.get('created_at','')[:16]}"
             )
+
+    # ── get_image ─────────────────────────────────────────────────────────────
+    if tool == "get_image":
+        image_url = inp.get("image_url", "").strip()
+        if not image_url:
+            return "❌ Thiếu image_url."
+        try:
+            resp = httpx.get(image_url, timeout=15, follow_redirects=True)
+            if resp.status_code != 200:
+                return f"❌ Không tải được ảnh (HTTP {resp.status_code})."
+            content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+            b64 = base64.b64encode(resp.content).decode()
+            size_kb = len(resp.content) // 1024
+            return (
+                f"🖼️  **Ảnh đã tải** ({size_kb} KB | {content_type})\n"
+                f"URL: {image_url}\n\n"
+                f"data:{content_type};base64,{b64}"
+            )
+        except httpx.TimeoutException:
+            return "❌ Timeout khi tải ảnh."
+        except Exception as e:
+            return f"❌ Lỗi tải ảnh: {e}"
+
+    # ── get_question_by_answer_id ─────────────────────────────────────────────
+    if tool == "get_question_by_answer_id":
+        answer_id = inp.get("answer_id", "").strip()
+        if not answer_id:
+            return "❌ Thiếu answer_id."
+        # Lấy question_id từ answer
+        a = supabase.table("answers")\
+            .select("id,question_id,body,user_id,moderation_status,removed_reason,profiles(username)")\
+            .eq("id", answer_id).single().execute()
+        if not a.data:
+            return "Không tìm thấy câu trả lời."
+        question_id = a.data.get("question_id")
+        if not question_id:
+            return "❌ Câu trả lời này không có question_id."
+        # Lấy thông tin câu hỏi cha
+        q = supabase.table("questions")\
+            .select("*,profiles(username)")\
+            .eq("id", question_id).single().execute()
+        if not q.data:
+            return f"❌ Không tìm thấy câu hỏi cha (question_id: {question_id})."
+        qd = q.data
+        ad = a.data
+        return (
+            f"🔗 **NGỮ CẢNH: Answer → Question**\n\n"
+            f"💬 **CÂU TRẢ LỜI** `{ad['id']}`\n"
+            f"👤 {ad['profiles']['username'] if ad.get('profiles') else '?'}\n"
+            f"📄 {ad.get('body','')[:200]}\n"
+            f"📊 {ad.get('moderation_status','')} | 🚩 {ad.get('removed_reason') or '(chưa gắn cờ)'}\n\n"
+            f"📚 **CÂU HỎI CHA** `{qd['id']}`\n"
+            f"👤 {qd['profiles']['username'] if qd.get('profiles') else '?'}\n"
+            f"📌 {qd.get('grade_group','')} | {qd.get('subject','')}\n"
+            f"📋 {qd.get('title','')}\n"
+            f"📄 {qd.get('body','') or '(không có)'}\n"
+            f"🖼️  {qd.get('image_url') or '(không có ảnh)'}\n"
+            f"📊 {qd.get('status','')} | 👁️  {qd.get('views',0)} lượt\n"
+            f"🕐 {qd.get('created_at','')[:16]}\n\n"
+            f"💡 Dùng remove_content với ref_id=`{qd['id']}` ref_type='question' nếu muốn xóa câu hỏi cha."
+        )
 
     if tool == "approve_content":
         ref_id   = inp.get("ref_id","")
@@ -706,7 +790,6 @@ async def handle_jsonrpc(request: Request) -> dict:
 # ── MCP endpoints ─────────────────────────────────────────────────────────────
 @app.get("/mcp")
 async def mcp_info():
-    """Discovery endpoint — Claude.ai GET /mcp để tìm server"""
     return {
         "jsonrpc": "2.0",
         "result" : {
@@ -719,7 +802,6 @@ async def mcp_info():
 @app.post("/mcp")
 async def mcp_endpoint(request: Request,
                        authorization: str = Header(None)):
-    """Streamable HTTP — Claude.ai mới POST vào /mcp"""
     if authorization and authorization != f"Bearer {ADMIN_TOKEN}":
         raise HTTPException(401, "Unauthorized")
     return await handle_jsonrpc(request)
@@ -727,7 +809,6 @@ async def mcp_endpoint(request: Request,
 @app.post("/messages")
 async def messages_endpoint(request: Request,
                             authorization: str = Header(None)):
-    """Alias /messages → /mcp"""
     if authorization and authorization != f"Bearer {ADMIN_TOKEN}":
         raise HTTPException(401, "Unauthorized")
     return await handle_jsonrpc(request)
@@ -735,7 +816,6 @@ async def messages_endpoint(request: Request,
 @app.get("/sse")
 async def sse_endpoint(request: Request,
                        authorization: str = Header(None)):
-    """SSE fallback cho client cũ"""
     if authorization and authorization != f"Bearer {ADMIN_TOKEN}":
         raise HTTPException(401, "Unauthorized")
 
@@ -767,7 +847,7 @@ async def sse_endpoint(request: Request,
         }
     )
 
-# ── REST endpoints ─────────────────────────────────────────────────────────────
+# ── REST endpoints ────────────────────────────────────────────────────────────
 class ModerateRequest(BaseModel):
     text   : str
     context: str = "question"
