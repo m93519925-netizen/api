@@ -60,11 +60,12 @@ async def oauth_metadata():
 
 @app.get("/oauth/authorize")
 async def oauth_authorize(
+    response_type        : str = "",
+    client_id            : str = "",
     redirect_uri         : str = "",
     state                : str = "",
     code_challenge       : str = "",
     code_challenge_method: str = "",
-    **kwargs
 ):
     code = hashlib.sha256(f"{ADMIN_TOKEN}{time.time()}".encode()).hexdigest()[:32]
     _auth_codes[code] = {
@@ -654,7 +655,6 @@ async def sse_endpoint(request: Request,
         raise HTTPException(401, "Unauthorized")
 
     async def event_stream():
-        # Gửi server info
         init = {
             "jsonrpc": "2.0",
             "method" : "notifications/initialized",
@@ -669,7 +669,6 @@ async def sse_endpoint(request: Request,
         }
         yield f"data: {json.dumps(init, ensure_ascii=False)}\n\n"
 
-        # Gửi danh sách tools
         tools_msg = {
             "jsonrpc": "2.0",
             "method" : "notifications/tools/list_changed",
@@ -677,7 +676,6 @@ async def sse_endpoint(request: Request,
         }
         yield f"data: {json.dumps(tools_msg, ensure_ascii=False)}\n\n"
 
-        # Keep-alive
         while True:
             if await request.is_disconnected():
                 break
