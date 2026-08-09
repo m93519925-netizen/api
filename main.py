@@ -214,11 +214,9 @@ MCP_TOOLS = [
 
 # ── MCP Tool executor ─────────────────────────────────────────────────────────
 def execute_tool(tool: str, inp: dict) -> str:
-    # ── list_flagged ──────────────────────────────────────────────────────────
     if tool == "list_flagged":
         content_type = inp.get("type", "all")
         lines = []
-
         if content_type in ("question", "all"):
             r = supabase.table("questions")\
                 .select("id,title,user_id,removed_reason,created_at,profiles(username)")\
@@ -235,7 +233,6 @@ def execute_tool(tool: str, inp: dict) -> str:
                         f"🚩 {q.get('removed_reason','')}\n"
                         f"🕐 {q.get('created_at','')[:16]}\n---"
                     )
-
         if content_type in ("answer", "all"):
             r = supabase.table("answers")\
                 .select("id,body,user_id,removed_reason,created_at,profiles(username)")\
@@ -252,10 +249,8 @@ def execute_tool(tool: str, inp: dict) -> str:
                         f"🚩 {a.get('removed_reason','')}\n"
                         f"🕐 {a.get('created_at','')[:16]}\n---"
                     )
-
         return "\n".join(lines) if lines else "✅ Không có nội dung nào bị gắn cờ."
 
-    # ── list_pending_reports ──────────────────────────────────────────────────
     if tool == "list_pending_reports":
         r = supabase.table("reports")\
             .select("id,ref_id,ref_type,reason,detail,created_at,profiles(username)")\
@@ -274,7 +269,6 @@ def execute_tool(tool: str, inp: dict) -> str:
             )
         return "\n".join(lines)
 
-    # ── list_pending_appeals ──────────────────────────────────────────────────
     if tool == "list_pending_appeals":
         r = supabase.table("appeals")\
             .select("id,user_id,ref_id,ref_type,content,created_at,profiles(username)")\
@@ -292,7 +286,6 @@ def execute_tool(tool: str, inp: dict) -> str:
             )
         return "\n".join(lines)
 
-    # ── get_content_detail ────────────────────────────────────────────────────
     if tool == "get_content_detail":
         ref_id   = inp.get("ref_id","")
         ref_type = inp.get("ref_type","")
@@ -301,7 +294,7 @@ def execute_tool(tool: str, inp: dict) -> str:
                 .select("*,profiles(username)").eq("id", ref_id).single().execute()
             if not r.data: return "Không tìm thấy câu hỏi."
             q = r.data
-            result = (
+            return (
                 f"📚 **CÂU HỎI**\n🆔 `{q['id']}`\n"
                 f"👤 {q['profiles']['username'] if q.get('profiles') else '?'}\n"
                 f"📌 {q.get('grade_group','')} | {q.get('subject','')}\n"
@@ -318,7 +311,7 @@ def execute_tool(tool: str, inp: dict) -> str:
                 .eq("id", ref_id).single().execute()
             if not r.data: return "Không tìm thấy câu trả lời."
             a = r.data
-            result = (
+            return (
                 f"💬 **CÂU TRẢ LỜI**\n🆔 `{a['id']}`\n"
                 f"👤 {a['profiles']['username'] if a.get('profiles') else '?'}\n"
                 f"❓ {a['questions']['title'] if a.get('questions') else a.get('question_id','')}\n"
@@ -327,9 +320,7 @@ def execute_tool(tool: str, inp: dict) -> str:
                 f"📊 {a.get('moderation_status','')} | 🚩 {a.get('removed_reason') or '(chưa gắn cờ)'}\n"
                 f"🕐 {a.get('created_at','')[:16]}"
             )
-        return result
 
-    # ── approve_content ───────────────────────────────────────────────────────
     if tool == "approve_content":
         ref_id   = inp.get("ref_id","")
         ref_type = inp.get("ref_type","")
@@ -360,7 +351,6 @@ def execute_tool(tool: str, inp: dict) -> str:
                 ref_id,"answer")
         return f"✅ Đã duyệt {ref_type} `{ref_id[:8]}`."
 
-    # ── remove_content ────────────────────────────────────────────────────────
     if tool == "remove_content":
         ref_id    = inp.get("ref_id","")
         ref_type  = inp.get("ref_type","")
@@ -400,7 +390,6 @@ def execute_tool(tool: str, inp: dict) -> str:
                 .eq("id", report_id).execute()
         return f"🚫 Đã xóa {ref_type} `{ref_id[:8]}`."
 
-    # ── approve_appeal ────────────────────────────────────────────────────────
     if tool == "approve_appeal":
         appeal_id = inp.get("appeal_id","")
         reason    = inp.get("reason","Admin chấp nhận kháng cáo")
@@ -429,7 +418,6 @@ def execute_tool(tool: str, inp: dict) -> str:
             a["ref_id"],a["ref_type"],appeal_id)
         return f"✅ Đã chấp nhận kháng cáo `{appeal_id[:8]}`."
 
-    # ── reject_appeal ─────────────────────────────────────────────────────────
     if tool == "reject_appeal":
         appeal_id = inp.get("appeal_id","")
         reason    = inp.get("reason","Admin từ chối kháng cáo")
@@ -445,7 +433,6 @@ def execute_tool(tool: str, inp: dict) -> str:
             ap.data["ref_id"],ap.data["ref_type"],appeal_id)
         return f"❌ Đã từ chối kháng cáo `{appeal_id[:8]}`."
 
-    # ── resolve_report ────────────────────────────────────────────────────────
     if tool == "resolve_report":
         report_id    = inp.get("report_id","")
         action_taken = inp.get("action_taken", False)
@@ -468,7 +455,6 @@ def execute_tool(tool: str, inp: dict) -> str:
                     r["ref_id"],r["ref_type"])
         return f"✅ Đã resolve report `{report_id[:8]}`."
 
-    # ── get_stats ─────────────────────────────────────────────────────────────
     if tool == "get_stats":
         logs = supabase.table("moderation_logs").select("label").execute()
         rpts = supabase.table("reports").select("status").execute()
@@ -646,64 +632,12 @@ def process_item(itype, data):
     except Exception as e:
         print(f"  ❌ process error: {e}")
 
-# ── MCP SSE endpoint (chuẩn MCP over HTTP) ───────────────────────────────────
-@app.get("/sse")
-async def sse_endpoint(request: Request,
-                       authorization: str = Header(None)):
-    """SSE endpoint — Claude.ai kết nối vào đây"""
-    if authorization and authorization != f"Bearer {ADMIN_TOKEN}":
-        raise HTTPException(401, "Unauthorized")
-
-    async def event_stream():
-        init = {
-            "jsonrpc": "2.0",
-            "method" : "notifications/initialized",
-            "params" : {
-                "protocolVersion": "2024-11-05",
-                "capabilities"   : {"tools": {}},
-                "serverInfo"     : {
-                    "name"   : "hoibai-panel",
-                    "version": "5.0.0",
-                },
-            }
-        }
-        yield f"data: {json.dumps(init, ensure_ascii=False)}\n\n"
-
-        tools_msg = {
-            "jsonrpc": "2.0",
-            "method" : "notifications/tools/list_changed",
-            "params" : {},
-        }
-        yield f"data: {json.dumps(tools_msg, ensure_ascii=False)}\n\n"
-
-        while True:
-            if await request.is_disconnected():
-                break
-            yield f": ping\n\n"
-            await asyncio.sleep(15)
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control"              : "no-cache",
-            "X-Accel-Buffering"          : "no",
-            "Access-Control-Allow-Origin": "*",
-        }
-    )
-
-@app.post("/messages")
-async def messages_endpoint(request: Request,
-                            authorization: str = Header(None)):
-    """JSON-RPC endpoint — Claude gửi tool calls vào đây"""
-    if authorization and authorization != f"Bearer {ADMIN_TOKEN}":
-        raise HTTPException(401, "Unauthorized")
-
-    body = await request.json()
-    method = body.get("method","")
+# ── JSON-RPC handler dùng chung ───────────────────────────────────────────────
+async def handle_jsonrpc(request: Request) -> dict:
+    body   = await request.json()
+    method = body.get("method", "")
     req_id = body.get("id")
 
-    # Initialize
     if method == "initialize":
         return {
             "jsonrpc": "2.0",
@@ -715,7 +649,6 @@ async def messages_endpoint(request: Request,
             }
         }
 
-    # List tools
     if method == "tools/list":
         return {
             "jsonrpc": "2.0",
@@ -723,10 +656,9 @@ async def messages_endpoint(request: Request,
             "result" : {"tools": MCP_TOOLS},
         }
 
-    # Call tool
     if method == "tools/call":
         params    = body.get("params", {})
-        tool_name = params.get("name","")
+        tool_name = params.get("name", "")
         tool_inp  = params.get("arguments", {})
 
         if not supabase:
@@ -762,7 +694,6 @@ async def messages_endpoint(request: Request,
                 }
             }
 
-    # Ping
     if method == "ping":
         return {"jsonrpc":"2.0","id":req_id,"result":{}}
 
@@ -772,7 +703,71 @@ async def messages_endpoint(request: Request,
         "error"  : {"code":-32601,"message":f"Method '{method}' not found"},
     }
 
-# ── Schemas & REST endpoints ──────────────────────────────────────────────────
+# ── MCP endpoints ─────────────────────────────────────────────────────────────
+@app.get("/mcp")
+async def mcp_info():
+    """Discovery endpoint — Claude.ai GET /mcp để tìm server"""
+    return {
+        "jsonrpc": "2.0",
+        "result" : {
+            "protocolVersion": "2024-11-05",
+            "capabilities"   : {"tools": {}},
+            "serverInfo"     : {"name":"hoibai-panel","version":"5.0.0"},
+        }
+    }
+
+@app.post("/mcp")
+async def mcp_endpoint(request: Request,
+                       authorization: str = Header(None)):
+    """Streamable HTTP — Claude.ai mới POST vào /mcp"""
+    if authorization and authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(401, "Unauthorized")
+    return await handle_jsonrpc(request)
+
+@app.post("/messages")
+async def messages_endpoint(request: Request,
+                            authorization: str = Header(None)):
+    """Alias /messages → /mcp"""
+    if authorization and authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(401, "Unauthorized")
+    return await handle_jsonrpc(request)
+
+@app.get("/sse")
+async def sse_endpoint(request: Request,
+                       authorization: str = Header(None)):
+    """SSE fallback cho client cũ"""
+    if authorization and authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(401, "Unauthorized")
+
+    async def event_stream():
+        init = {
+            "jsonrpc": "2.0",
+            "method" : "notifications/initialized",
+            "params" : {
+                "protocolVersion": "2024-11-05",
+                "capabilities"   : {"tools": {}},
+                "serverInfo"     : {"name":"hoibai-panel","version":"5.0.0"},
+            }
+        }
+        yield f"data: {json.dumps(init, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'jsonrpc':'2.0','method':'notifications/tools/list_changed','params':{}}, ensure_ascii=False)}\n\n"
+        while True:
+            if await request.is_disconnected():
+                break
+            yield f": ping\n\n"
+            await asyncio.sleep(15)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control"              : "no-cache",
+            "X-Accel-Buffering"          : "no",
+            "Access-Control-Allow-Origin": "*",
+        }
+    )
+
+# ── REST endpoints ─────────────────────────────────────────────────────────────
 class ModerateRequest(BaseModel):
     text   : str
     context: str = "question"
@@ -824,5 +819,5 @@ async def root():
         "service": "HoiBai Moderator",
         "version": "5.0.0",
         "mode"   : "manual_review via MCP",
-        "mcp_url": f"{BASE_URL}/sse",
+        "mcp_url": f"{BASE_URL}/mcp",
     }
