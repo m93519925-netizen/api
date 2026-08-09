@@ -1,21 +1,25 @@
-import os, re, unicodedata, asyncio
+import os, re, unicodedata, asyncio, hashlib, time, base64
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from collections import Counter
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SUPABASE_URL  = os.getenv("SUPABASE_URL",         "")
 SUPABASE_KEY  = os.getenv("SUPABASE_SERVICE_KEY", "")
 MCP_SECRET    = os.getenv("MCP_SECRET",           "")
+ADMIN_TOKEN   = os.getenv("ADMIN_TOKEN",          "hoibai-admin-secret")
+BASE_URL      = os.getenv("BASE_URL",             "https://api-production-8d4b7.up.railway.app")
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL",    "30"))
 BATCH_SIZE    = int(os.getenv("BATCH_SIZE",       "5"))
 
-supabase  = None
-scan_task = None
+supabase    = None
+scan_task   = None
+_auth_codes: dict = {}
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
@@ -45,12 +49,73 @@ app = FastAPI(title="HoiBai Moderator (MCP)", version="5.0.0", lifespan=lifespan
 app.add_middleware(CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ── Hard Rules (không dùng AI, chỉ rule cứng) ────────────────────────────────
+# ── OAuth 2.0 ─────────────────────────────────────────────────────────────────
+@app.get("/.well-known/oauth-authorization-server")
+async def oauth_metadata():
+    return {
+        "issuer"                                : BASE_URL,
+        "authorization_endpoint"               : f"{BASE_URL}/oauth/authorize",
+        "token_endpoint"                        : f"{BASE_URL}/oauth/token",
+        "response_types_supported"             : ["code"],
+        "grant_types_supported"                : ["authorization_code"],
+        "code_challenge_methods_supported"     : ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    }
+
+@app.get("/oauth/authorize")
+async def oauth_authorize(
+    client_id            : str = "",
+    redirect_uri         : str = "",
+    state                : str = "",
+    code_challenge       : str = "",
+    code_challenge_method: str = "",
+    response_type        : str = "",
+):
+    """Tự động authorize không cần đăng nhập — dùng ADMIN_TOKEN"""
+    code = hashlib.sha256(f"{ADMIN_TOKEN}{time.time()}".encode()).hexdigest()[:32]
+    _auth_codes[code] = {
+        "code_challenge": code_challenge,
+        "expires"       : time.time() + 300,
+    }
+    url = f"{redirect_uri}?code={code}"
+    if state:
+        url += f"&state={state}"
+    return RedirectResponse(url, status_code=302)
+
+@app.post("/oauth/token")
+async def oauth_token(
+    grant_type   : str = Form(""),
+    code         : str = Form(""),
+    redirect_uri : str = Form(""),
+    code_verifier: str = Form(""),
+    client_id    : str = Form(""),
+):
+    # Dọn code hết hạn
+    expired = [k for k, v in _auth_codes.items() if v["expires"] < time.time()]
+    for k in expired:
+        del _auth_codes[k]
+
+    if code not in _auth_codes:
+        raise HTTPException(400, "invalid_grant")
+
+    stored = _auth_codes.pop(code)
+
+    # Verify PKCE nếu có
+    if stored.get("code_challenge") and code_verifier:
+        verifier_hash = base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode()).digest()
+        ).rstrip(b"=").decode()
+        if verifier_hash != stored["code_challenge"]:
+            raise HTTPException(400, "invalid_grant: PKCE mismatch")
+
+    return {
+        "access_token": ADMIN_TOKEN,
+        "token_type"  : "bearer",
+        "expires_in"  : 86400,
+    }
+
+# ── Hard Rules ────────────────────────────────────────────────────────────────
 def hard_rules(text: str) -> tuple:
-    """
-    Trả về (label, reason) nếu vi phạm rule cứng,
-    hoặc (None, "") nếu cần admin xem xét.
-    """
     t = text.strip()
     if len(t) < 2:
         return "MEANINGLESS", "Quá ngắn"
@@ -65,10 +130,9 @@ def hard_rules(text: str) -> tuple:
     ):
         return "MEANINGLESS", "Không có chữ cái"
 
-    # Từ khóa nghi ngờ — đưa vào hàng chờ admin duyệt
     SUSPICIOUS_PATTERNS = [
         r'(?i)(sex|porn|18\+|địt|lồn|cặc|đụ|fuck|shit)',
-        r'(?i)(quảng cáo|mua ngay|liên hệ|zalo|telegram|t\.me/)',
+        r'(?i)(quảng cáo|mua ngay|liên hệ zalo|telegram|t\.me/)',
         r'https?://\S+',
         r'\b0\d{9,10}\b',
     ]
@@ -77,13 +141,6 @@ def hard_rules(text: str) -> tuple:
             return "SUSPICIOUS", f"Khớp pattern: {pattern}"
 
     return None, ""
-
-def classify_content(text: str) -> tuple:
-    """Phân loại nội dung bằng rule cứng, không dùng AI."""
-    label, reason = hard_rules(text)
-    if label:
-        return label, reason
-    return "PENDING_REVIEW", "Cần admin xem xét"
 
 # ── Notifications ─────────────────────────────────────────────────────────────
 def send_notification(user_id: str, ntype: str, title: str,
@@ -150,28 +207,25 @@ async def scanner_loop():
 async def scan_batch():
     if not supabase: return
     try:
-        # Câu hỏi mới (pending)
         qs = supabase.table("questions")\
             .select("id,title,body,user_id,points_cost")\
             .eq("status","pending")\
             .limit(BATCH_SIZE).execute()
 
-        # Câu trả lời mới (pending)
         ans = supabase.table("answers")\
             .select("id,body,user_id,question_id")\
             .eq("moderation_status","pending")\
             .limit(BATCH_SIZE).execute()
 
-        # Reports pending
         reports = supabase.table("reports")\
             .select("id,ref_id,ref_type,reason,reporter_id")\
             .eq("status","pending")\
             .limit(BATCH_SIZE).execute()
 
         items = []
-        for q in (qs.data  or []): items.append(("question", q))
-        for a in (ans.data or []): items.append(("answer",   a))
-        for r in (reports.data or []): items.append(("report", r))
+        for q in (qs.data      or []): items.append(("question", q))
+        for a in (ans.data     or []): items.append(("answer",   a))
+        for r in (reports.data or []): items.append(("report",   r))
 
         if items:
             print(f"🔍 Quét {len(items)} items...")
@@ -190,19 +244,14 @@ def process_item(itype: str, data: dict):
             _handle_report(data)
             return
 
-        # Lấy text để check rule cứng
-        if itype == "question":
-            text = f"{data['title']} {data.get('body','') or ''}"
-        else:
-            text = data["body"]
+        text = f"{data['title']} {data.get('body','') or ''}" \
+               if itype == "question" else data["body"]
 
         label, reason = hard_rules(text)
 
         if label in ("MEANINGLESS", "SUSPICIOUS"):
-            # Vi phạm rule cứng → đánh dấu cần admin duyệt
             _flag_for_review(itype, data, label, reason)
         else:
-            # Sạch → approve
             if itype == "question":
                 supabase.table("questions")\
                     .update({"status": "open", "removed_by_ai": False})\
@@ -212,31 +261,26 @@ def process_item(itype: str, data: dict):
                     .update({"moderation_status": "approved", "removed_by_ai": False})\
                     .eq("id", data["id"]).execute()
                 _notify_new_answer(data)
-
             print(f"  ✅ [{itype}] {data['id'][:8]} → approved")
 
     except Exception as e:
         print(f"  ❌ process error [{itype}]: {e}")
 
 def _flag_for_review(itype: str, data: dict, label: str, reason: str):
-    """Đánh dấu nội dung nghi ngờ để admin xem xét."""
     try:
         if itype == "question":
-            text = f"{data['title']} {data.get('body','') or ''}"
             supabase.table("questions").update({
-                "status"         : "pending",
-                "removed_reason" : f"[Chờ admin] {label}: {reason}",
+                "status"        : "pending",
+                "removed_reason": f"[Chờ admin] {label}: {reason}",
             }).eq("id", data["id"]).execute()
         else:
             supabase.table("answers").update({
                 "moderation_status": "pending",
                 "removed_reason"   : f"[Chờ admin] {label}: {reason}",
             }).eq("id", data["id"]).execute()
-            text = data["body"]
 
         _log_violation(data["user_id"], data["id"], itype, label, reason)
         print(f"  🚩 [{itype}] {data['id'][:8]} → flagged ({label}: {reason})")
-
     except Exception as e:
         print(f"  ❌ flag error: {e}")
 
@@ -259,17 +303,8 @@ def _notify_new_answer(answer: dict):
         print(f"  ⚠️  Notify answer error: {e}")
 
 def _handle_report(report: dict):
-    """Đánh dấu report để admin xem xét — không tự xóa."""
     try:
-        ref_id      = report["ref_id"]
-        ref_type    = report["ref_type"]
         reporter_id = report.get("reporter_id")
-
-        # Giữ status pending để admin thấy trong MCP
-        # Chỉ log lại
-        print(f"  🚩 Report {report['id'][:8]} → chờ admin duyệt")
-
-        # Thông báo reporter là đã nhận report
         if reporter_id:
             send_notification(
                 user_id  = reporter_id,
@@ -277,16 +312,16 @@ def _handle_report(report: dict):
                 title    = "📨 Báo cáo đã được tiếp nhận",
                 message  = "Báo cáo của bạn đã được ghi nhận và sẽ được admin xem xét sớm. "
                            "Cảm ơn bạn đã đóng góp cho cộng đồng!",
-                ref_id   = ref_id,
-                ref_type = ref_type,
+                ref_id   = report["ref_id"],
+                ref_type = report["ref_type"],
             )
-
+        print(f"  🚩 Report {report['id'][:8]} → chờ admin duyệt")
     except Exception as e:
         print(f"  ❌ Report error: {e}")
 
 # ── MCP Auth ──────────────────────────────────────────────────────────────────
 def verify_mcp(authorization: str = Header(None)):
-    if MCP_SECRET and authorization != f"Bearer {MCP_SECRET}":
+    if authorization != f"Bearer {ADMIN_TOKEN}":
         raise HTTPException(401, "Unauthorized")
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -295,29 +330,21 @@ class ModerateRequest(BaseModel):
     context: str = "question"
 
 class ModerateResponse(BaseModel):
-    label     : str
-    allowed   : bool
-    reason    : str
+    label  : str
+    allowed: bool
+    reason : str
 
 class MCPToolCall(BaseModel):
     tool : str
     input: dict = {}
 
-# ── /moderate endpoint (PHP gọi) ──────────────────────────────────────────────
+# ── /moderate (PHP gọi) ───────────────────────────────────────────────────────
 @app.post("/moderate", response_model=ModerateResponse)
 async def moderate(req: ModerateRequest):
-    """PHP gọi endpoint này khi user submit — chỉ dùng rule cứng."""
-    text = req.text.strip()
-    label, reason = hard_rules(text)
-
+    label, reason = hard_rules(req.text.strip())
     if label in ("MEANINGLESS", "SUSPICIOUS"):
-        return ModerateResponse(
-            label=label, allowed=False, reason=reason
-        )
-    # Còn lại → cho phép, scanner sẽ xem xét sau
-    return ModerateResponse(
-        label="CLEAN", allowed=True, reason="Passed rules"
-    )
+        return ModerateResponse(label=label, allowed=False, reason=reason)
+    return ModerateResponse(label="CLEAN", allowed=True, reason="Passed rules")
 
 # ── MCP Info ──────────────────────────────────────────────────────────────────
 @app.get("/mcp")
@@ -361,7 +388,7 @@ async def mcp_info():
             },
             {
                 "name"       : "approve_content",
-                "description": "Duyệt nội dung — cho phép hiển thị (câu hỏi bị gắn cờ hoặc answer pending)",
+                "description": "Duyệt nội dung — cho phép hiển thị",
                 "inputSchema": {
                     "type"      : "object",
                     "properties": {
@@ -412,13 +439,13 @@ async def mcp_info():
             },
             {
                 "name"       : "resolve_report",
-                "description": "Đánh dấu báo cáo đã xử lý (sau khi remove_content hoặc xác nhận không vi phạm)",
+                "description": "Đánh dấu báo cáo đã xử lý",
                 "inputSchema": {
                     "type"      : "object",
                     "properties": {
-                        "report_id"  : {"type":"string","description":"ID báo cáo"},
-                        "action_taken": {"type":"boolean","description":"true nếu đã xóa nội dung, false nếu không vi phạm"},
-                        "reason"     : {"type":"string","description":"Lý do quyết định"},
+                        "report_id"   : {"type":"string","description":"ID báo cáo"},
+                        "action_taken": {"type":"boolean","description":"true nếu đã xóa, false nếu không vi phạm"},
+                        "reason"      : {"type":"string","description":"Lý do quyết định"},
                     },
                     "required": ["report_id","action_taken","reason"],
                 },
@@ -459,7 +486,7 @@ async def mcp_call(req: MCPToolCall,
                         f"🆔 `{q['id']}`\n"
                         f"👤 {q['profiles']['username'] if q.get('profiles') else '?'}\n"
                         f"📋 {q.get('title','')[:100]}\n"
-                        f"🚩 Lý do gắn cờ: {q.get('removed_reason','')}\n"
+                        f"🚩 {q.get('removed_reason','')}\n"
                         f"🕐 {q.get('created_at','')[:16]}\n---"
                     )
 
@@ -477,7 +504,7 @@ async def mcp_call(req: MCPToolCall,
                         f"🆔 `{a['id']}`\n"
                         f"👤 {a['profiles']['username'] if a.get('profiles') else '?'}\n"
                         f"📄 {a.get('body','')[:100]}...\n"
-                        f"🚩 Lý do gắn cờ: {a.get('removed_reason','')}\n"
+                        f"🚩 {a.get('removed_reason','')}\n"
                         f"🕐 {a.get('created_at','')[:16]}\n---"
                     )
 
@@ -504,7 +531,7 @@ async def mcp_call(req: MCPToolCall,
                 f"📌 Loại: {rep['ref_type']} | ID nội dung: `{rep['ref_id']}`\n"
                 f"⚠️  Lý do: {rep['reason']}\n"
                 f"📝 Chi tiết: {rep.get('detail') or '(không có)'}\n"
-                f"🕐 Gửi: {rep['created_at'][:16]}\n---"
+                f"🕐 {rep['created_at'][:16]}\n---"
             )
         return {"result": "\n".join(lines)}
 
@@ -523,10 +550,10 @@ async def mcp_call(req: MCPToolCall,
         for a in r.data:
             lines.append(
                 f"🆔 Appeal: `{a['id']}`\n"
-                f"👤 User: {a['profiles']['username'] if a.get('profiles') else a['user_id'][:8]}\n"
+                f"👤 {a['profiles']['username'] if a.get('profiles') else a['user_id'][:8]}\n"
                 f"📌 Loại: {a['ref_type']} | ID nội dung: `{a['ref_id']}`\n"
-                f"💬 Lý do kháng cáo: {a['content'][:300]}\n"
-                f"🕐 Gửi: {a['created_at'][:16]}\n---"
+                f"💬 {a['content'][:300]}\n"
+                f"🕐 {a['created_at'][:16]}\n---"
             )
         return {"result": "\n".join(lines)}
 
@@ -544,21 +571,17 @@ async def mcp_call(req: MCPToolCall,
             q = r.data
             result = (
                 f"📚 **CÂU HỎI**\n"
-                f"🆔 ID: `{q['id']}`\n"
-                f"👤 Tác giả: {q['profiles']['username'] if q.get('profiles') else '?'}\n"
-                f"📌 Khối: {q.get('grade_group','')} | Môn: {q.get('subject','')}\n"
-                f"📋 Tiêu đề: {q.get('title','')}\n"
-                f"📄 Nội dung: {q.get('body','') or '(không có)'}\n"
-                f"🖼️  Ảnh: {q.get('image_url') or '(không có)'}\n"
+                f"🆔 `{q['id']}`\n"
+                f"👤 {q['profiles']['username'] if q.get('profiles') else '?'}\n"
+                f"📌 {q.get('grade_group','')} | {q.get('subject','')}\n"
+                f"📋 {q.get('title','')}\n"
+                f"📄 {q.get('body','') or '(không có)'}\n"
+                f"🖼️  {q.get('image_url') or '(không có ảnh)'}\n"
                 f"📊 Status: {q.get('status','')}\n"
-                f"🚩 Lý do gắn cờ: {q.get('removed_reason') or '(chưa gắn cờ)'}\n"
-                f"👁️  Lượt xem: {q.get('views',0)}\n"
-                f"⭐ Điểm thưởng: {q.get('points_cost',0)}\n"
-                f"🕐 Đăng: {q.get('created_at','')[:16]}"
+                f"🚩 {q.get('removed_reason') or '(chưa gắn cờ)'}\n"
+                f"👁️  {q.get('views',0)} lượt xem | ⭐ {q.get('points_cost',0)} điểm\n"
+                f"🕐 {q.get('created_at','')[:16]}"
             )
-            if q.get("image_url"):
-                result += f"\n\n🖼️  **Link ảnh:** {q['image_url']}"
-
         else:
             r = supabase.table("answers")\
                 .select("*,profiles(username),questions(title)")\
@@ -568,17 +591,15 @@ async def mcp_call(req: MCPToolCall,
             a = r.data
             result = (
                 f"💬 **CÂU TRẢ LỜI**\n"
-                f"🆔 ID: `{a['id']}`\n"
-                f"👤 Tác giả: {a['profiles']['username'] if a.get('profiles') else '?'}\n"
-                f"❓ Câu hỏi: {a['questions']['title'] if a.get('questions') else a.get('question_id','')}\n"
-                f"📄 Nội dung: {a.get('body','')}\n"
-                f"🖼️  Ảnh: {a.get('image_url') or '(không có)'}\n"
+                f"🆔 `{a['id']}`\n"
+                f"👤 {a['profiles']['username'] if a.get('profiles') else '?'}\n"
+                f"❓ {a['questions']['title'] if a.get('questions') else a.get('question_id','')}\n"
+                f"📄 {a.get('body','')}\n"
+                f"🖼️  {a.get('image_url') or '(không có ảnh)'}\n"
                 f"📊 Status: {a.get('moderation_status','')}\n"
-                f"🚩 Lý do gắn cờ: {a.get('removed_reason') or '(chưa gắn cờ)'}\n"
-                f"🕐 Đăng: {a.get('created_at','')[:16]}"
+                f"🚩 {a.get('removed_reason') or '(chưa gắn cờ)'}\n"
+                f"🕐 {a.get('created_at','')[:16]}"
             )
-            if a.get("image_url"):
-                result += f"\n\n🖼️  **Link ảnh:** {a['image_url']}"
 
         return {"result": result}
 
@@ -603,7 +624,7 @@ async def mcp_call(req: MCPToolCall,
                 user_id  = r.data["user_id"],
                 ntype    = "appeal_approved",
                 title    = "✅ Câu hỏi của bạn đã được duyệt",
-                message  = f'Câu hỏi "{r.data.get("title","")[:50]}" đã được admin duyệt và hiển thị. '
+                message  = f'Câu hỏi "{r.data.get("title","")[:50]}" đã được admin duyệt. '
                            f'Lý do: {reason}',
                 ref_id   = ref_id,
                 ref_type = "question",
@@ -619,7 +640,6 @@ async def mcp_call(req: MCPToolCall,
                 "removed_by_ai"    : False,
                 "removed_reason"   : None,
             }).eq("id", ref_id).execute()
-            # Thông báo chủ câu hỏi
             _notify_new_answer({
                 "id"         : ref_id,
                 "user_id"    : r.data["user_id"],
@@ -662,7 +682,7 @@ async def mcp_call(req: MCPToolCall,
                 user_id  = r.data["user_id"],
                 ntype    = "content_removed",
                 title    = "⚠️ Câu hỏi bị xóa bởi Admin",
-                message  = f'Câu hỏi "{r.data.get("title","")[:50]}" đã bị Admin xóa. '
+                message  = f'Câu hỏi "{r.data.get("title","")[:50]}" bị Admin xóa. '
                            f'Lý do: {reason}. Bạn có thể kháng cáo nếu cho rằng quyết định này sai.',
                 ref_id   = ref_id,
                 ref_type = "question",
@@ -685,13 +705,12 @@ async def mcp_call(req: MCPToolCall,
                 user_id  = r.data["user_id"],
                 ntype    = "content_removed",
                 title    = "⚠️ Câu trả lời bị xóa bởi Admin",
-                message  = f'Câu trả lời của bạn đã bị Admin xóa. '
+                message  = f'Câu trả lời của bạn bị Admin xóa. '
                            f'Lý do: {reason}. Bạn có thể kháng cáo nếu cho rằng quyết định này sai.',
                 ref_id   = ref_id,
                 ref_type = "answer",
             )
 
-        # Đánh dấu report resolved nếu có
         if report_id:
             supabase.table("reports")\
                 .update({"status":"resolved"})\
@@ -712,12 +731,11 @@ async def mcp_call(req: MCPToolCall,
         a        = ap.data
         ref_id   = a["ref_id"]
         ref_type = a["ref_type"]
-        now      = datetime.now(timezone.utc).isoformat()
 
         supabase.table("appeals").update({
             "status"     : "approved",
             "review_note": reason,
-            "reviewed_at": now,
+            "reviewed_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", appeal_id).execute()
 
         if ref_type == "question":
@@ -743,8 +761,7 @@ async def mcp_call(req: MCPToolCall,
             user_id   = a["user_id"],
             ntype     = "appeal_approved",
             title     = "✅ Kháng cáo thành công! (Admin duyệt)",
-            message   = f'Admin đã chấp nhận kháng cáo của bạn. '
-                       f'Nội dung đã được khôi phục. Lý do: {reason}',
+            message   = f'Admin đã chấp nhận kháng cáo. Nội dung đã được khôi phục. Lý do: {reason}',
             ref_id    = ref_id,
             ref_type  = ref_type,
             appeal_id = appeal_id,
@@ -772,8 +789,7 @@ async def mcp_call(req: MCPToolCall,
             user_id   = ap.data["user_id"],
             ntype     = "appeal_rejected",
             title     = "❌ Kháng cáo không thành công (Admin duyệt)",
-            message   = f'Admin đã xem xét kháng cáo của bạn nhưng không chấp nhận. '
-                       f'Lý do: {reason}',
+            message   = f'Admin đã xem xét nhưng không chấp nhận kháng cáo. Lý do: {reason}',
             ref_id    = ap.data["ref_id"],
             ref_type  = ap.data["ref_type"],
             appeal_id = appeal_id,
@@ -788,8 +804,7 @@ async def mcp_call(req: MCPToolCall,
         reason       = inp.get("reason","")
 
         rep = supabase.table("reports")\
-            .select("*,profiles(username)")\
-            .eq("id", report_id).single().execute()
+            .select("*").eq("id", report_id).single().execute()
         if not rep.data:
             return {"result": "Không tìm thấy báo cáo."}
 
@@ -806,8 +821,7 @@ async def mcp_call(req: MCPToolCall,
                     user_id  = reporter_id,
                     ntype    = "report_resolved",
                     title    = "✅ Báo cáo của bạn đã được xử lý",
-                    message  = f'Cảm ơn bạn đã báo cáo! Admin đã xem xét và xử lý nội dung vi phạm. '
-                               f'Lý do: {reason}',
+                    message  = f'Admin đã xem xét và xử lý nội dung vi phạm. Lý do: {reason}',
                     ref_id   = r["ref_id"],
                     ref_type = r["ref_type"],
                 )
@@ -816,29 +830,24 @@ async def mcp_call(req: MCPToolCall,
                     user_id  = reporter_id,
                     ntype    = "report_resolved",
                     title    = "ℹ️ Báo cáo đã được xem xét",
-                    message  = f'Admin đã xem xét nội dung bị báo cáo nhưng không phát hiện vi phạm. '
-                               f'Lý do: {reason}. Cảm ơn bạn đã đóng góp cho cộng đồng!',
+                    message  = f'Admin đã xem xét nhưng không phát hiện vi phạm. '
+                               f'Lý do: {reason}. Cảm ơn bạn đã đóng góp!',
                     ref_id   = r["ref_id"],
                     ref_type = r["ref_type"],
                 )
 
-        return {"result": f"✅ Đã đánh dấu report `{report_id[:8]}` là resolved. Thông báo đã gửi cho reporter."}
+        return {"result": f"✅ Đã resolve report `{report_id[:8]}`. Thông báo đã gửi cho reporter."}
 
     # ── get_stats ─────────────────────────────────────────────────────────────
     if tool == "get_stats":
-        logs  = supabase.table("moderation_logs").select("label,ref_type").execute()
-        rpts  = supabase.table("reports").select("status").execute()
-        apps  = supabase.table("appeals").select("status").execute()
+        logs = supabase.table("moderation_logs").select("label,ref_type").execute()
+        rpts = supabase.table("reports").select("status").execute()
+        apps = supabase.table("appeals").select("status").execute()
 
-        # Đếm nội dung đang chờ duyệt
-        q_pending = supabase.table("questions")\
-            .select("id", count="exact")\
-            .eq("status","pending")\
-            .not_.is_("removed_reason","null").execute()
-        a_pending = supabase.table("answers")\
-            .select("id", count="exact")\
-            .eq("moderation_status","pending")\
-            .not_.is_("removed_reason","null").execute()
+        qp = supabase.table("questions").select("id",count="exact")\
+            .eq("status","pending").not_.is_("removed_reason","null").execute()
+        ap = supabase.table("answers").select("id",count="exact")\
+            .eq("moderation_status","pending").not_.is_("removed_reason","null").execute()
 
         r_counts = Counter(r["status"] for r in (rpts.data or []))
         a_counts = Counter(a["status"] for a in (apps.data or []))
@@ -847,8 +856,8 @@ async def mcp_call(req: MCPToolCall,
         result = (
             f"📊 **THỐNG KÊ HỆ THỐNG**\n\n"
             f"⏳ **Chờ admin duyệt:**\n"
-            f"  - Câu hỏi bị gắn cờ: {q_pending.count or 0}\n"
-            f"  - Câu trả lời bị gắn cờ: {a_pending.count or 0}\n"
+            f"  - Câu hỏi bị gắn cờ: {qp.count or 0}\n"
+            f"  - Câu trả lời bị gắn cờ: {ap.count or 0}\n"
             f"  - Báo cáo pending: {r_counts.get('pending',0)}\n"
             f"  - Kháng cáo pending: {a_counts.get('pending',0)}\n\n"
             f"🚫 **Vi phạm đã xử lý:** {len(logs.data or [])}\n"
@@ -868,19 +877,19 @@ async def health():
     counts = {}
     if supabase:
         try:
-            q = supabase.table("questions").select("id",count="exact")\
+            qp = supabase.table("questions").select("id",count="exact")\
                 .eq("status","pending").not_.is_("removed_reason","null").execute()
-            a = supabase.table("answers").select("id",count="exact")\
+            ap = supabase.table("answers").select("id",count="exact")\
                 .eq("moderation_status","pending").not_.is_("removed_reason","null").execute()
-            r = supabase.table("reports").select("id",count="exact")\
+            rp = supabase.table("reports").select("id",count="exact")\
                 .eq("status","pending").execute()
-            ap = supabase.table("appeals").select("id",count="exact")\
+            pp = supabase.table("appeals").select("id",count="exact")\
                 .eq("status","pending").execute()
             counts = {
-                "questions_flagged": q.count or 0,
-                "answers_flagged"  : a.count or 0,
-                "reports_pending"  : r.count or 0,
-                "appeals_pending"  : ap.count or 0,
+                "questions_flagged": qp.count or 0,
+                "answers_flagged"  : ap.count or 0,
+                "reports_pending"  : rp.count or 0,
+                "appeals_pending"  : pp.count or 0,
             }
         except: pass
     return {
