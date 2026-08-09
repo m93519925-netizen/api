@@ -144,7 +144,7 @@ MCP_TOOLS = [
     },
     {
         "name"       : "get_image",
-        "description": "Tải ảnh từ URL và trả về base64 để admin xem nội dung ảnh đính kèm, phát hiện vi phạm trong ảnh",
+        "description": "Tải ảnh từ URL và trả về dạng image block để admin xem nội dung ảnh đính kèm, phát hiện vi phạm trong ảnh",
         "inputSchema": {
             "type"      : "object",
             "properties": {
@@ -236,7 +236,8 @@ MCP_TOOLS = [
 ]
 
 # ── MCP Tool executor ─────────────────────────────────────────────────────────
-def execute_tool(tool: str, inp: dict) -> str:
+# Trả về str hoặc list[dict] (content blocks cho image)
+def execute_tool(tool: str, inp: dict):
     if tool == "list_flagged":
         content_type = inp.get("type", "all")
         lines = []
@@ -354,13 +355,27 @@ def execute_tool(tool: str, inp: dict) -> str:
             if resp.status_code != 200:
                 return f"❌ Không tải được ảnh (HTTP {resp.status_code})."
             content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-            b64 = base64.b64encode(resp.content).decode()
-            size_kb = len(resp.content) // 1024
-            return (
-                f"🖼️  **Ảnh đã tải** ({size_kb} KB | {content_type})\n"
-                f"URL: {image_url}\n\n"
-                f"data:{content_type};base64,{b64}"
-            )
+            # Chỉ chấp nhận image types hợp lệ
+            if not content_type.startswith("image/"):
+                content_type = "image/jpeg"
+            b64      = base64.b64encode(resp.content).decode()
+            size_kb  = len(resp.content) // 1024
+            # Trả về image block — Claude nhận được ảnh thực để phân tích,
+            # không phải chuỗi base64 thô (tiết kiệm token hơn)
+            return [
+                {
+                    "type": "text",
+                    "text": f"🖼️ Ảnh ({size_kb} KB | {content_type})\nURL: {image_url}",
+                },
+                {
+                    "type"  : "image",
+                    "source": {
+                        "type"      : "base64",
+                        "media_type": content_type,
+                        "data"      : b64,
+                    },
+                },
+            ]
         except httpx.TimeoutException:
             return "❌ Timeout khi tải ảnh."
         except Exception as e:
@@ -371,7 +386,6 @@ def execute_tool(tool: str, inp: dict) -> str:
         answer_id = inp.get("answer_id", "").strip()
         if not answer_id:
             return "❌ Thiếu answer_id."
-        # Lấy question_id từ answer
         a = supabase.table("answers")\
             .select("id,question_id,body,user_id,moderation_status,removed_reason,profiles(username)")\
             .eq("id", answer_id).single().execute()
@@ -380,7 +394,6 @@ def execute_tool(tool: str, inp: dict) -> str:
         question_id = a.data.get("question_id")
         if not question_id:
             return "❌ Câu trả lời này không có question_id."
-        # Lấy thông tin câu hỏi cha
         q = supabase.table("questions")\
             .select("*,profiles(username)")\
             .eq("id", question_id).single().execute()
@@ -760,13 +773,13 @@ async def handle_jsonrpc(request: Request) -> dict:
             result = await loop.run_in_executor(
                 None, lambda: execute_tool(tool_name, tool_inp)
             )
+            # result có thể là str (text) hoặc list (image blocks)
+            content = result if isinstance(result, list) \
+                      else [{"type":"text","text": result}]
             return {
                 "jsonrpc": "2.0",
                 "id"     : req_id,
-                "result" : {
-                    "content": [{"type":"text","text": result}],
-                    "isError": False,
-                }
+                "result" : {"content": content, "isError": False},
             }
         except Exception as e:
             return {
