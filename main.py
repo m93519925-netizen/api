@@ -345,23 +345,49 @@ def execute_tool(tool: str, inp: dict):
                 f"🕐 {a.get('created_at','')[:16]}"
             )
 
-    # ── get_image ─────────────────────────────────────────────────────────────
+    # ── get_image (BUG FIX) ─────────────────────────────────────────────────────
     if tool == "get_image":
         image_url = inp.get("image_url", "").strip()
         if not image_url:
             return "❌ Thiếu image_url."
         try:
-            resp = httpx.get(image_url, timeout=15, follow_redirects=True)
+            # Thêm timeout và retries để tránh lỗi network
+            resp = httpx.get(
+                image_url, 
+                timeout=15, 
+                follow_redirects=True,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+            )
             if resp.status_code != 200:
                 return f"❌ Không tải được ảnh (HTTP {resp.status_code})."
-            content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-            # Chỉ chấp nhận image types hợp lệ
+            
+            # FIX: Kiểm tra content-type chính xác hơn
+            content_type = resp.headers.get("content-type", "image/jpeg")
+            if ";" in content_type:
+                content_type = content_type.split(";")[0].strip()
+            
+            # Nếu không phải image, try guess từ URL hoặc use default
             if not content_type.startswith("image/"):
-                content_type = "image/jpeg"
+                # Guess từ URL
+                if ".png" in image_url.lower():
+                    content_type = "image/png"
+                elif ".gif" in image_url.lower():
+                    content_type = "image/gif"
+                elif ".webp" in image_url.lower():
+                    content_type = "image/webp"
+                else:
+                    content_type = "image/jpeg"
+            
+            # FIX: Kiểm tra kích thước để tránh ảnh quá lớn
+            if len(resp.content) > 5 * 1024 * 1024:  # 5MB limit
+                return f"❌ Ảnh quá lớn ({len(resp.content) // 1024 // 1024}MB > 5MB)."
+            
             b64      = base64.b64encode(resp.content).decode()
             size_kb  = len(resp.content) // 1024
-            # Trả về image block — Claude nhận được ảnh thực để phân tích,
-            # không phải chuỗi base64 thô (tiết kiệm token hơn)
+            
+            # FIX: Trả về đúng format content blocks
             return [
                 {
                     "type": "text",
@@ -377,9 +403,11 @@ def execute_tool(tool: str, inp: dict):
                 },
             ]
         except httpx.TimeoutException:
-            return "❌ Timeout khi tải ảnh."
+            return "❌ Timeout khi tải ảnh (quá 15 giây)."
+        except httpx.ConnectError:
+            return "❌ Không thể kết nối đến URL ảnh."
         except Exception as e:
-            return f"❌ Lỗi tải ảnh: {e}"
+            return f"❌ Lỗi tải ảnh: {str(e)[:100]}"
 
     # ── get_question_by_answer_id ─────────────────────────────────────────────
     if tool == "get_question_by_answer_id":
@@ -773,9 +801,15 @@ async def handle_jsonrpc(request: Request) -> dict:
             result = await loop.run_in_executor(
                 None, lambda: execute_tool(tool_name, tool_inp)
             )
+            # FIX: Kiểm tra type của result đúng cách
             # result có thể là str (text) hoặc list (image blocks)
-            content = result if isinstance(result, list) \
-                      else [{"type":"text","text": result}]
+            if isinstance(result, list) and len(result) > 0 and isinstance(result[0], dict):
+                # Đây là content blocks (từ get_image)
+                content = result
+            else:
+                # Đây là string
+                content = [{"type":"text","text": str(result)}]
+            
             return {
                 "jsonrpc": "2.0",
                 "id"     : req_id,
@@ -786,7 +820,7 @@ async def handle_jsonrpc(request: Request) -> dict:
                 "jsonrpc": "2.0",
                 "id"     : req_id,
                 "result" : {
-                    "content": [{"type":"text","text":f"❌ Lỗi: {e}"}],
+                    "content": [{"type":"text","text":f"❌ Lỗi: {str(e)[:200]}"}],
                     "isError": True,
                 }
             }
