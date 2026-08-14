@@ -12,7 +12,7 @@ from pydantic import BaseModel
 SUPABASE_URL  = os.getenv("SUPABASE_URL",         "")
 SUPABASE_KEY  = os.getenv("SUPABASE_SERVICE_KEY", "")
 ADMIN_TOKEN   = os.getenv("ADMIN_TOKEN",          "hoibai-admin-secret")
-BASE_URL      = os.getenv("BASE_URL",             "https://api-production-8d4b7.up.railway.app")
+BASE_URL      = os.getenv("BASE_URL",             "https://api-production-a365.up.railway.app/")
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL",    "30"))
 BATCH_SIZE    = int(os.getenv("BATCH_SIZE",       "5"))
 
@@ -1160,10 +1160,17 @@ def execute_tool(tool: str, inp: dict) -> str:
         reason  = inp.get("reason","")
         level   = int(inp.get("level",1))
         is_ban  = level >= 3
+        # Nối thêm lý do mới vào lịch sử thay vì ghi đè, để user thấy đủ các lần vi phạm
+        p = supabase.table("profiles").select("ban_reason")\
+            .eq("id",user_id).single().execute()
+        old_reason = (p.data or {}).get("ban_reason") or ""
+        today = datetime.now(timezone.utc).strftime("%d/%m/%Y")
+        new_entry = f"[{today}] {reason}"
+        combined_reason = f"{old_reason}\n{new_entry}" if old_reason else new_entry
         supabase.table("profiles").update({
             "violation_level": level,
             "is_banned"      : is_ban,
-            "ban_reason"     : reason,
+            "ban_reason"     : combined_reason,
         }).eq("id",user_id).execute()
         level_vi = {1:"Cảnh báo",2:"Nghiêm trọng",3:"Khóa tài khoản"}
         send_notification(user_id,"content_removed",
