@@ -1,6 +1,6 @@
 import os, re, asyncio, hashlib, time, base64, json
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import Counter
 
 from fastapi import FastAPI, Header, HTTPException, Form, Request
@@ -12,7 +12,7 @@ from pydantic import BaseModel
 SUPABASE_URL  = os.getenv("SUPABASE_URL",         "")
 SUPABASE_KEY  = os.getenv("SUPABASE_SERVICE_KEY", "")
 ADMIN_TOKEN   = os.getenv("ADMIN_TOKEN",          "hoibai-admin-secret")
-BASE_URL      = os.getenv("BASE_URL",             "https://api-production-a365.up.railway.app")
+BASE_URL      = os.getenv("BASE_URL",             "https://api-production-8d4b7.up.railway.app")
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL",    "30"))
 BATCH_SIZE    = int(os.getenv("BATCH_SIZE",       "5"))
 
@@ -41,7 +41,7 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError: pass
     print("👋 Shutdown!")
 
-app = FastAPI(title="HoiBai Moderator (MCP)", version="5.1.0", lifespan=lifespan)
+app = FastAPI(title="HoiBai Moderator (MCP)", version="5.2.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -114,6 +114,87 @@ MCP_TOOLS = [
         },
     },
     {
+        "name"       : "get_user_id_by_username",
+        "description": "Tra UUID của user từ username (hỗ trợ tìm gần đúng nếu không khớp chính xác) — dùng trước khi gọi ban_user/get_user_history",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "username": {"type":"string","description":"Username cần tra, ví dụ 'tuibigay'"},
+            },
+            "required": ["username"],
+        },
+    },
+    {
+        "name"       : "search_users",
+        "description": "Tìm/lọc user theo tên (gần đúng), mức vi phạm, trạng thái khóa — dùng để rà soát tài khoản vi phạm lặp lại",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "username_like": {"type":"string","description":"Tìm username chứa chuỗi này (không bắt buộc)"},
+                "min_violation_level": {"type":"integer","description":"Lọc từ mức vi phạm này trở lên: 0-3 (không bắt buộc)"},
+                "is_banned": {"type":"boolean","description":"Lọc theo trạng thái bị khóa (không bắt buộc)"},
+                "limit": {"type":"integer","description":"Số kết quả tối đa, mặc định 30"},
+            },
+        },
+    },
+    {
+        "name"       : "bulk_remove_content",
+        "description": "Xóa nhiều nội dung (câu hỏi/câu trả lời) cùng lúc, thường dùng để dọn toàn bộ nội dung của 1 user vi phạm",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "description": "Danh sách nội dung cần xóa",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "ref_id"  : {"type":"string"},
+                            "ref_type": {"type":"string","description":"'question' hoặc 'answer'"},
+                        },
+                        "required": ["ref_id","ref_type"],
+                    },
+                },
+                "reason": {"type":"string","description":"Lý do áp dụng chung cho tất cả"},
+            },
+            "required": ["items","reason"],
+        },
+    },
+    {
+        "name"       : "bulk_ban_users",
+        "description": "Cảnh báo hoặc khóa nhiều tài khoản cùng lúc",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "user_ids": {"type":"array","items":{"type":"string"},"description":"Danh sách UUID user"},
+                "reason"  : {"type":"string"},
+                "level"   : {"type":"integer","description":"1=cảnh báo vàng, 2=nghiêm trọng đỏ, 3=khóa"},
+            },
+            "required": ["user_ids","reason","level"],
+        },
+    },
+    {
+        "name"       : "get_appeal_detail",
+        "description": "Lấy đầy đủ nội dung 1 kháng cáo (nội dung hoặc tài khoản) không bị cắt ngắn, kèm thông tin nội dung/user liên quan — dùng trước khi approve/reject",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "appeal_id": {"type":"string"},
+            },
+            "required": ["appeal_id"],
+        },
+    },
+    {
+        "name"       : "get_violation_analytics",
+        "description": "Thống kê vi phạm: top user vi phạm nhiều nhất, số nội dung bị xóa theo loại, timeline vi phạm theo ngày",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {"type":"integer","description":"Số ngày gần nhất để thống kê, mặc định 30"},
+            },
+        },
+    },
+    {
         "name"       : "list_pending_reports",
         "description": "Liệt kê báo cáo vi phạm đang chờ admin xử lý",
         "inputSchema": {"type":"object","properties":{}},
@@ -152,6 +233,17 @@ MCP_TOOLS = [
         },
     },
     {
+        "name"       : "get_user_by_username",
+        "description": "Tra cứu user_id (UUID) từ username — dùng trước khi gọi ban_user/get_user_history",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "username": {"type":"string","description":"Tên đăng nhập, không cần @"},
+            },
+            "required": ["username"],
+        },
+    },
+    {
         "name"       : "get_user_history",
         "description": "Xem toàn bộ lịch sử vi phạm, câu hỏi/trả lời bị xóa của user — dùng để xét kháng cáo ban",
         "inputSchema": {
@@ -160,6 +252,19 @@ MCP_TOOLS = [
                 "user_id": {"type":"string","description":"ID người dùng"},
             },
             "required": ["user_id"],
+        },
+    },
+    {
+        "name"       : "search_users",
+        "description": "Tìm/lọc người dùng theo tên hoặc mức vi phạm — dùng để phát hiện tài khoản vi phạm lặp lại",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "username_like"  : {"type":"string","description":"Tìm gần đúng theo username (không bắt buộc)"},
+                "min_violation"  : {"type":"integer","description":"Lọc violation_level >= giá trị này (0-3, không bắt buộc)"},
+                "is_banned"      : {"type":"boolean","description":"Lọc theo trạng thái bị khóa (không bắt buộc)"},
+                "limit"          : {"type":"integer","description":"Số kết quả tối đa (mặc định 20, tối đa 50)"},
+            },
         },
     },
     {
@@ -187,6 +292,33 @@ MCP_TOOLS = [
                 "report_id": {"type":"string","description":"ID report liên quan (nếu có)"},
             },
             "required": ["ref_id","ref_type","reason"],
+        },
+    },
+    {
+        "name"       : "bulk_remove_user_content",
+        "description": "Xóa nhiều câu hỏi/câu trả lời của 1 user cùng lúc — dùng khi phát hiện user vi phạm hàng loạt",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "user_id" : {"type":"string"},
+                "reason"  : {"type":"string"},
+                "content_types": {"type":"string","description":"'question','answer','all' (mặc định 'all')"},
+                "limit"   : {"type":"integer","description":"Số nội dung tối đa xóa mỗi loại (mặc định 20, tối đa 50)"},
+            },
+            "required": ["user_id","reason"],
+        },
+    },
+    {
+        "name"       : "bulk_ban_users",
+        "description": "Cảnh báo hoặc khóa nhiều user cùng lúc bằng cùng 1 lý do và mức độ",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "user_ids": {"type":"array","items":{"type":"string"},"description":"Danh sách user_id"},
+                "reason"  : {"type":"string"},
+                "level"   : {"type":"integer","description":"1=cảnh báo vàng, 2=nghiêm trọng đỏ, 3=khóa"},
+            },
+            "required": ["user_ids","reason","level"],
         },
     },
     {
@@ -238,6 +370,17 @@ MCP_TOOLS = [
         },
     },
     {
+        "name"       : "get_appeal_detail",
+        "description": "Xem đầy đủ nội dung 1 kháng cáo (không bị cắt ngắn) — dùng trước khi approve/reject",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "appeal_id": {"type":"string"},
+            },
+            "required": ["appeal_id"],
+        },
+    },
+    {
         "name"       : "resolve_report",
         "description": "Đánh dấu báo cáo đã xử lý và thông báo người báo cáo",
         "inputSchema": {
@@ -279,6 +422,16 @@ MCP_TOOLS = [
         "name"       : "get_stats",
         "description": "Thống kê tổng quan hệ thống",
         "inputSchema": {"type":"object","properties":{}},
+    },
+    {
+        "name"       : "get_violation_analytics",
+        "description": "Thống kê chi tiết vi phạm: top user vi phạm nhiều nhất, số nội dung xóa theo loại, timeline vi phạm gần đây",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {"type":"integer","description":"Số ngày gần nhất cần thống kê (mặc định 7)"},
+            },
+        },
     },
 ]
 
@@ -322,6 +475,175 @@ def execute_tool(tool: str, inp: dict) -> str:
                         f"🕐 {a.get('created_at','')[:16]}\n---"
                     )
         return "\n".join(lines) if lines else "✅ Không có nội dung bị gắn cờ."
+
+    # ── get_user_id_by_username ──────────────────────────────────────────────
+    if tool == "get_user_id_by_username":
+        username = inp.get("username","").strip()
+        if not username:
+            return "⚠️ Thiếu username."
+        exact = supabase.table("profiles")\
+            .select("id,username,violation_level,is_banned,points")\
+            .eq("username",username).limit(5).execute()
+        if exact.data:
+            lines = [f"✅ **{len(exact.data)} kết quả khớp chính xác '{username}':**\n"]
+            for p in exact.data:
+                lines.append(
+                    f"🆔 `{p['id']}`\n"
+                    f"👤 {p['username']}\n"
+                    f"📊 Mức vi phạm: {p.get('violation_level',0)} | "
+                    f"{'🔒 Đã khóa' if p.get('is_banned') else '✅ Bình thường'}\n"
+                    f"⭐ {p.get('points',0)} điểm\n---"
+                )
+            return "\n".join(lines)
+        # Không khớp chính xác → tìm gần đúng
+        fuzzy = supabase.table("profiles")\
+            .select("id,username,violation_level,is_banned")\
+            .ilike("username",f"%{username}%").limit(10).execute()
+        if not fuzzy.data:
+            return f"❌ Không tìm thấy user nào có username giống '{username}'."
+        lines = [f"⚠️ Không khớp chính xác. **{len(fuzzy.data)} kết quả gần đúng:**\n"]
+        for p in fuzzy.data:
+            lines.append(
+                f"🆔 `{p['id']}`\n"
+                f"👤 {p['username']}\n"
+                f"📊 Mức vi phạm: {p.get('violation_level',0)} | "
+                f"{'🔒 Đã khóa' if p.get('is_banned') else '✅ Bình thường'}\n---"
+            )
+        return "\n".join(lines)
+
+    # ── search_users ──────────────────────────────────────────────────────────
+    if tool == "search_users":
+        username_like = inp.get("username_like","").strip()
+        min_vl        = inp.get("min_violation_level")
+        is_banned     = inp.get("is_banned")
+        limit         = int(inp.get("limit",30))
+
+        q = supabase.table("profiles")\
+            .select("id,username,violation_level,is_banned,ban_reason,points,redemption_points")
+        if username_like:
+            q = q.ilike("username",f"%{username_like}%")
+        if min_vl is not None:
+            q = q.gte("violation_level",int(min_vl))
+        if is_banned is not None:
+            q = q.eq("is_banned",bool(is_banned))
+        r = q.order("violation_level",desc=True).limit(limit).execute()
+
+        if not r.data:
+            return "❌ Không tìm thấy user nào khớp bộ lọc."
+        lines = [f"👥 **{len(r.data)} user khớp bộ lọc:**\n"]
+        vl_map = {0:"✅ Bình thường",1:"⚠️ Cảnh báo",2:"🔴 Nghiêm trọng",3:"🔒 Bị khóa"}
+        for p in r.data:
+            lines.append(
+                f"🆔 `{p['id']}`\n"
+                f"👤 {p['username']}\n"
+                f"📊 {vl_map.get(p.get('violation_level',0),'?')}"
+                + (f" - {p.get('ban_reason')}" if p.get('is_banned') and p.get('ban_reason') else "") + "\n"
+                f"⭐ {p.get('points',0)} điểm"
+                + (f" | 🔓 Chuộc: {p.get('redemption_points',0)}/100" if p.get('is_banned') else "") + "\n---"
+            )
+        return "\n".join(lines)
+
+    # ── bulk_remove_content ──────────────────────────────────────────────────
+    if tool == "bulk_remove_content":
+        items  = inp.get("items",[])
+        reason = inp.get("reason","Admin xóa hàng loạt")
+        if not items:
+            return "⚠️ Danh sách items rỗng."
+        results = []
+        for item in items:
+            r = execute_tool("remove_content", {
+                "ref_id": item.get("ref_id",""),
+                "ref_type": item.get("ref_type",""),
+                "reason": reason,
+            })
+            results.append(f"  • {item.get('ref_type')} `{item.get('ref_id','')[:8]}` → {r}")
+        return f"🚫 **Đã xử lý {len(items)} nội dung:**\n" + "\n".join(results)
+
+    # ── bulk_ban_users ────────────────────────────────────────────────────────
+    if tool == "bulk_ban_users":
+        user_ids = inp.get("user_ids",[])
+        reason   = inp.get("reason","")
+        level    = int(inp.get("level",1))
+        if not user_ids:
+            return "⚠️ Danh sách user_ids rỗng."
+        results = []
+        for uid in user_ids:
+            r = execute_tool("ban_user", {
+                "user_id": uid, "reason": reason, "level": level,
+            })
+            results.append(f"  • `{uid[:8]}` → {r}")
+        return f"⚖️ **Đã xử lý {len(user_ids)} user:**\n" + "\n".join(results)
+
+    # ── get_appeal_detail ─────────────────────────────────────────────────────
+    if tool == "get_appeal_detail":
+        appeal_id = inp.get("appeal_id","")
+        ap = supabase.table("appeals").select("*,profiles(username,violation_level,is_banned)")\
+            .eq("id",appeal_id).single().execute()
+        if not ap.data:
+            return "❌ Không tìm thấy kháng cáo."
+        a = ap.data
+        result = (
+            f"⚖️ **CHI TIẾT KHÁNG CÁO** `{a['id']}`\n"
+            f"👤 {a['profiles']['username'] if a.get('profiles') else a.get('user_id','?')[:8]}\n"
+            f"📌 Loại: {a.get('ref_type','?')}\n"
+            f"📊 Trạng thái: {a.get('status','?')}\n"
+            f"🕐 {a.get('created_at','')[:16]}\n\n"
+            f"📝 **Nội dung kháng cáo đầy đủ:**\n{a.get('content','(trống)')}\n"
+        )
+        if a.get('review_note'):
+            result += f"\n📋 Ghi chú admin trước đó: {a['review_note']}\n"
+        if a.get('ref_type') in ('question','answer') and a.get('ref_id'):
+            detail = execute_tool("get_content_detail", {
+                "ref_id": a['ref_id'], "ref_type": a['ref_type'],
+            })
+            result += f"\n──── Nội dung liên quan ────\n{detail}"
+        elif a.get('ref_type') == 'account':
+            history = execute_tool("get_user_history", {"user_id": a.get('user_id','')})
+            result += f"\n──── Lịch sử tài khoản ────\n{history}"
+        return result
+
+    # ── get_violation_analytics ──────────────────────────────────────────────
+    if tool == "get_violation_analytics":
+        days = int(inp.get("days",30))
+        since = (datetime.now(timezone.utc).timestamp() - days*86400)
+        since_iso = datetime.fromtimestamp(since,tz=timezone.utc).isoformat()
+
+        logs = supabase.table("moderation_logs")\
+            .select("user_id,ref_type,label,created_at,profiles(username)")\
+            .gte("created_at",since_iso)\
+            .order("created_at",desc=False).limit(500).execute()
+        ld = logs.data or []
+
+        if not ld:
+            return f"✅ Không có vi phạm nào trong {days} ngày qua."
+
+        top_users = Counter()
+        by_type   = Counter()
+        by_day    = Counter()
+        uname_map = {}
+        for l in ld:
+            uid = l.get("user_id","?")
+            top_users[uid] += 1
+            by_type[l.get("ref_type","?")] += 1
+            by_day[l.get("created_at","")[:10]] += 1
+            if l.get("profiles"):
+                uname_map[uid] = l["profiles"].get("username","?")
+
+        result = f"📊 **PHÂN TÍCH VI PHẠM ({days} ngày qua, {len(ld)} bản ghi)**\n\n"
+        result += "🔝 **Top 10 user vi phạm nhiều nhất:**\n"
+        for uid, cnt in top_users.most_common(10):
+            uname = uname_map.get(uid, uid[:8] if uid != "?" else "?")
+            result += f"  • {uname} (`{uid[:8]}`): {cnt} lần\n"
+
+        result += "\n📂 **Theo loại nội dung:**\n"
+        for t, cnt in by_type.most_common():
+            result += f"  • {t}: {cnt}\n"
+
+        result += "\n📅 **Timeline theo ngày (10 ngày gần nhất có vi phạm):**\n"
+        for day, cnt in sorted(by_day.items())[-10:]:
+            result += f"  • {day}: {cnt} vi phạm\n"
+
+        return result
 
     # ── list_pending_reports ──────────────────────────────────────────────────
     if tool == "list_pending_reports":
@@ -454,6 +776,26 @@ def execute_tool(tool: str, inp: dict) -> str:
             f"💡 remove_content ref_id=`{qd['id']}` ref_type='question' để xóa câu hỏi cha."
         )
 
+    # ── get_user_by_username ──────────────────────────────────────────────────
+    if tool == "get_user_by_username":
+        username = inp.get("username","").strip().lstrip("@")
+        if not username: return "Vui lòng nhập username."
+        r = supabase.table("profiles")\
+            .select("id,username,violation_level,is_banned,ban_reason,points,redemption_points,created_at")\
+            .eq("username",username).limit(1).execute()
+        if not r.data:
+            return f"Không tìm thấy user có username '{username}'."
+        p = r.data[0]
+        vl_map = {0:"✅ Bình thường",1:"⚠️ Cảnh báo",2:"🔴 Nghiêm trọng",3:"🔒 Bị khóa"}
+        return (
+            f"👤 **{p['username']}**\n"
+            f"🆔 `{p['id']}`\n"
+            f"📊 {vl_map.get(p.get('violation_level',0),'?')}\n"
+            f"🔒 Bị khóa: {'Có - '+(p.get('ban_reason') or '?') if p.get('is_banned') else 'Không'}\n"
+            f"⭐ Điểm: {p.get('points',0)} | Điểm chuộc: {p.get('redemption_points',0)}/100\n"
+            f"🕐 Tham gia: {(p.get('created_at') or '')[:10]}"
+        )
+
     # ── get_user_history ──────────────────────────────────────────────────────
     if tool == "get_user_history":
         user_id = inp.get("user_id","")
@@ -496,6 +838,33 @@ def execute_tool(tool: str, inp: dict) -> str:
             for l in logs.data:
                 result += f"  [{l['ref_type']}] {l['label']}: {l['reason']} ({l['created_at'][:10]})\n"
         return result
+
+    # ── search_users ──────────────────────────────────────────────────────────
+    if tool == "search_users":
+        limit = min(int(inp.get("limit",20) or 20), 50)
+        q = supabase.table("profiles")\
+            .select("id,username,violation_level,is_banned,points,created_at")
+        username_like = (inp.get("username_like") or "").strip()
+        if username_like:
+            q = q.ilike("username", f"%{username_like}%")
+        min_violation = inp.get("min_violation")
+        if min_violation is not None:
+            q = q.gte("violation_level", int(min_violation))
+        is_banned = inp.get("is_banned")
+        if is_banned is not None:
+            q = q.eq("is_banned", bool(is_banned))
+        r = q.order("violation_level",desc=True).limit(limit).execute()
+        if not r.data:
+            return "Không tìm thấy user nào khớp điều kiện."
+        vl_map = {0:"✅",1:"⚠️",2:"🔴",3:"🔒"}
+        lines = [f"👥 **{len(r.data)} user tìm thấy:**\n"]
+        for p in r.data:
+            lines.append(
+                f"{vl_map.get(p.get('violation_level',0),'?')} **{p['username']}** "
+                f"`{p['id'][:8]}` | mức {p.get('violation_level',0)} | "
+                f"{'khóa' if p.get('is_banned') else 'hoạt động'} | {p.get('points',0)} điểm"
+            )
+        return "\n".join(lines)
 
     # ── approve_content ───────────────────────────────────────────────────────
     if tool == "approve_content":
@@ -569,6 +938,78 @@ def execute_tool(tool: str, inp: dict) -> str:
             supabase.table("reports").update({"status":"resolved"})\
                 .eq("id",report_id).execute()
         return f"🚫 Đã xóa {ref_type} `{ref_id[:8]}`."
+
+    # ── bulk_remove_user_content ─────────────────────────────────────────────
+    if tool == "bulk_remove_user_content":
+        user_id       = inp.get("user_id","")
+        reason        = inp.get("reason","Admin xóa hàng loạt")
+        content_types = inp.get("content_types","all")
+        limit         = min(int(inp.get("limit",20) or 20), 50)
+        removed_q, removed_a = [], []
+
+        if content_types in ("question","all"):
+            qs = supabase.table("questions").select("id,points_cost,title")\
+                .eq("user_id",user_id).in_("status",["open","pending"]).limit(limit).execute()
+            for q in (qs.data or []):
+                supabase.table("questions").update({
+                    "status":"removed","removed_by_ai":True,
+                    "removed_reason":f"Admin (bulk): {reason}",
+                }).eq("id",q["id"]).execute()
+                _refund_points(user_id,q.get("points_cost",0),q["id"])
+                _log_violation(user_id,q["id"],"question","REMOVED",f"Admin (bulk): {reason}")
+                removed_q.append(q["id"])
+
+        if content_types in ("answer","all"):
+            ans = supabase.table("answers").select("id,body")\
+                .eq("user_id",user_id).in_("moderation_status",["approved","pending"]).limit(limit).execute()
+            for a in (ans.data or []):
+                supabase.table("answers").update({
+                    "moderation_status":"removed","removed_by_ai":True,
+                    "removed_reason":f"Admin (bulk): {reason}",
+                    "removed_content":a.get("body","")[:1000],
+                }).eq("id",a["id"]).execute()
+                _log_violation(user_id,a["id"],"answer","REMOVED",f"Admin (bulk): {reason}")
+                removed_a.append(a["id"])
+
+        if removed_q or removed_a:
+            send_notification(user_id,"content_removed",
+                "⚠️ Nhiều nội dung bị xóa bởi Admin",
+                f'{len(removed_q)} câu hỏi và {len(removed_a)} câu trả lời của bạn bị Admin xóa. '
+                f'Lý do: {reason}. Bạn có thể kháng cáo từng nội dung.',
+                None,None)
+
+        return (
+            f"🚫 Đã xóa {len(removed_q)} câu hỏi và {len(removed_a)} câu trả lời "
+            f"của user `{user_id[:8]}`."
+        )
+
+    # ── bulk_ban_users ────────────────────────────────────────────────────────
+    if tool == "bulk_ban_users":
+        user_ids = inp.get("user_ids") or []
+        reason   = inp.get("reason","")
+        level    = int(inp.get("level",1))
+        is_ban   = level >= 3
+        level_vi = {1:"Cảnh báo",2:"Nghiêm trọng",3:"Khóa tài khoản"}
+        ok, failed = [], []
+        for uid in user_ids:
+            try:
+                supabase.table("profiles").update({
+                    "violation_level": level,
+                    "is_banned"      : is_ban,
+                    "ban_reason"     : reason,
+                }).eq("id",uid).execute()
+                send_notification(uid,"content_removed",
+                    f"⚠️ Tài khoản bị {'khóa' if is_ban else 'cảnh báo'}",
+                    f'Tài khoản ở mức {level_vi.get(level,"?")}. Lý do: {reason}. '
+                    f'{"Bạn có thể kháng cáo." if is_ban else "Hãy tuân thủ quy tắc cộng đồng."}',
+                    None,None)
+                ok.append(uid)
+            except Exception as e:
+                failed.append(uid)
+        result = f"✅ Đã xử lý {len(ok)}/{len(user_ids)} user ở mức {level} ({'khóa' if is_ban else 'cảnh báo'})."
+        if failed:
+            result += f"\n❌ Lỗi với {len(failed)} user: " + ", ".join(u[:8] for u in failed)
+        return result
 
     # ── approve_appeal (chỉ kháng cáo nội dung: question/answer) ────────────────
     if tool == "approve_appeal":
@@ -660,6 +1101,29 @@ def execute_tool(tool: str, inp: dict) -> str:
             f'Kháng cáo bị từ chối. Tài khoản vẫn bị khóa. Lý do: {reason}',
             None,None,appeal_id)
         return f"❌ Đã từ chối kháng cáo ban `{appeal_id[:8]}`."
+
+    # ── get_appeal_detail ─────────────────────────────────────────────────────
+    if tool == "get_appeal_detail":
+        appeal_id = inp.get("appeal_id","")
+        ap = supabase.table("appeals").select("*,profiles(username)")\
+            .eq("id",appeal_id).single().execute()
+        if not ap.data: return "Không tìm thấy kháng cáo."
+        a = ap.data
+        kind = "🔒 Kháng cáo tài khoản" if a["ref_type"] == "account" else "⚖️ Kháng cáo nội dung"
+        result = (
+            f"{kind}\n🆔 `{a['id']}`\n"
+            f"👤 {a['profiles']['username'] if a.get('profiles') else a['user_id'][:8]}\n"
+        )
+        if a["ref_type"] != "account":
+            result += f"📌 {a['ref_type']} | `{a.get('ref_id','')}`\n"
+        result += (
+            f"📊 Trạng thái: {a.get('status','')}\n"
+            f"💬 Nội dung đầy đủ:\n{a.get('content','')}\n"
+            f"🕐 {a.get('created_at','')[:16]}"
+        )
+        if a.get("review_note"):
+            result += f"\n📝 Ghi chú duyệt trước đó: {a['review_note']}"
+        return result
 
     # ── resolve_report ────────────────────────────────────────────────────────
     if tool == "resolve_report":
@@ -758,6 +1222,60 @@ def execute_tool(tool: str, inp: dict) -> str:
             f"\n\n🔒 Kháng cáo ban:\n"
             + "\n".join(f"  {k}: {v}" for k,v in b_counts.items())
         )
+
+    # ── get_violation_analytics ──────────────────────────────────────────────
+    if tool == "get_violation_analytics":
+        days = int(inp.get("days",7) or 7)
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+        logs = supabase.table("moderation_logs")\
+            .select("user_id,ref_type,label,created_at,profiles(username)")\
+            .gte("created_at",since)\
+            .order("created_at",desc=True).limit(500).execute()
+        data = logs.data or []
+
+        # Top user vi phạm nhiều nhất
+        user_counter = Counter()
+        username_map = {}
+        for l in data:
+            uid = l.get("user_id")
+            if not uid: continue
+            user_counter[uid] += 1
+            if l.get("profiles"):
+                username_map[uid] = l["profiles"].get("username","?")
+
+        top_users = user_counter.most_common(10)
+
+        # Số nội dung xóa theo loại
+        type_counter  = Counter(l["ref_type"] for l in data if l.get("ref_type"))
+        label_counter = Counter(l["label"]    for l in data if l.get("label"))
+
+        # Timeline theo ngày
+        day_counter = Counter((l.get("created_at") or "")[:10] for l in data)
+
+        lines = [f"📊 **THỐNG KÊ VI PHẠM ({days} ngày gần nhất, {len(data)} bản ghi)**\n"]
+
+        lines.append("🏆 Top user vi phạm nhiều nhất:")
+        if top_users:
+            for uid, cnt in top_users:
+                uname = username_map.get(uid, uid[:8])
+                lines.append(f"  {uname} (`{uid[:8]}`): {cnt} lần")
+        else:
+            lines.append("  (không có dữ liệu)")
+
+        lines.append("\n📁 Vi phạm theo loại nội dung:")
+        for k, v in type_counter.items():
+            lines.append(f"  {k}: {v}")
+
+        lines.append("\n🏷️ Vi phạm theo nhãn:")
+        for k, v in label_counter.items():
+            lines.append(f"  {k}: {v}")
+
+        lines.append("\n📅 Timeline (theo ngày):")
+        for day in sorted(day_counter.keys()):
+            lines.append(f"  {day}: {day_counter[day]} vi phạm")
+
+        return "\n".join(lines)
 
     return f"Tool '{tool}' không tồn tại."
 
@@ -1041,7 +1559,7 @@ async def handle_jsonrpc(request: Request) -> dict:
             "result":{
                 "protocolVersion":"2024-11-05",
                 "capabilities"   :{"tools":{}},
-                "serverInfo"     :{"name":"hoibai-panel","version":"5.1.0"},
+                "serverInfo"     :{"name":"hoibai-panel","version":"5.2.0"},
             }
         }
     if method == "tools/list":
@@ -1077,7 +1595,7 @@ async def mcp_info():
     return {"jsonrpc":"2.0","result":{
         "protocolVersion":"2024-11-05",
         "capabilities"   :{"tools":{}},
-        "serverInfo"     :{"name":"hoibai-panel","version":"5.1.0"},
+        "serverInfo"     :{"name":"hoibai-panel","version":"5.2.0"},
     }}
 
 @app.post("/mcp")
@@ -1103,7 +1621,7 @@ async def sse_endpoint(request: Request, authorization: str = Header(None)):
             "params":{
                 "protocolVersion":"2024-11-05",
                 "capabilities"   :{"tools":{}},
-                "serverInfo"     :{"name":"hoibai-panel","version":"5.1.0"},
+                "serverInfo"     :{"name":"hoibai-panel","version":"5.2.0"},
             }
         }
         yield f"data: {json.dumps(init,ensure_ascii=False)}\n\n"
@@ -1158,14 +1676,14 @@ async def health():
         "scanner": "running" if (supabase and scan_task
                     and not scan_task.done()) else "disabled",
         "pending": counts,
-        "version": "5.1.0",
+        "version": "5.2.0",
     }
 
 @app.get("/")
 async def root():
     return {
         "service": "HoiBai Moderator",
-        "version": "5.1.0",
+        "version": "5.2.0",
         "mode"   : "manual_review via MCP",
         "mcp_url": f"{BASE_URL}/mcp",
     }
