@@ -12,7 +12,7 @@ from pydantic import BaseModel
 SUPABASE_URL  = os.getenv("SUPABASE_URL",         "")
 SUPABASE_KEY  = os.getenv("SUPABASE_SERVICE_KEY", "")
 ADMIN_TOKEN   = os.getenv("ADMIN_TOKEN",          "hoibai-admin-secret")
-BASE_URL      = os.getenv("BASE_URL",             "https://api-production-a365.up.railway.app/")
+BASE_URL      = os.getenv("BASE_URL",             "https://api-production-a365.up.railway.app")
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL",    "30"))
 BATCH_SIZE    = int(os.getenv("BATCH_SIZE",       "5"))
 
