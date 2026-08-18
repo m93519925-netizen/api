@@ -1,6 +1,6 @@
-import os, re, asyncio, hashlib, time, base64, json
+import os, re, asyncio, hashlib, time, base64, json, secrets
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from collections import Counter
 
 from fastapi import FastAPI, Header, HTTPException, Form, Request
@@ -12,13 +12,17 @@ from pydantic import BaseModel
 SUPABASE_URL  = os.getenv("SUPABASE_URL",         "")
 SUPABASE_KEY  = os.getenv("SUPABASE_SERVICE_KEY", "")
 ADMIN_TOKEN   = os.getenv("ADMIN_TOKEN",          "hoibai-admin-secret")
-BASE_URL      = os.getenv("BASE_URL",             "https://api-production-a365.up.railway.app/")
+BASE_URL      = os.getenv("BASE_URL",             "https://api-production-8d4b7.up.railway.app")
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL",    "30"))
 BATCH_SIZE    = int(os.getenv("BATCH_SIZE",       "5"))
 
 supabase    = None
 scan_task   = None
 _auth_codes: dict = {}
+# Lưu tạm các yêu cầu bulk action đang chờ xác nhận (confirm step).
+# key = confirm_token, value = {"action":..., "payload":..., "expires": ts}
+_pending_confirms: dict = {}
+CONFIRM_TTL_SECONDS = 300  # token xác nhận hết hạn sau 5 phút
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
@@ -41,7 +45,7 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError: pass
     print("👋 Shutdown!")
 
-app = FastAPI(title="HoiBai Moderator (MCP)", version="5.2.0", lifespan=lifespan)
+app = FastAPI(title="HoiBai Moderator (MCP)", version="6.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -138,76 +142,26 @@ MCP_TOOLS = [
         },
     },
     {
-        "name"       : "bulk_remove_content",
-        "description": "Xóa nhiều nội dung (câu hỏi/câu trả lời) cùng lúc, thường dùng để dọn toàn bộ nội dung của 1 user vi phạm",
+        "name"       : "get_user_history",
+        "description": "Xem toàn bộ lịch sử vi phạm, câu hỏi/trả lời bị xóa của user — dùng để xét kháng cáo ban",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "items": {
-                    "type": "array",
-                    "description": "Danh sách nội dung cần xóa",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "ref_id"  : {"type":"string"},
-                            "ref_type": {"type":"string","description":"'question' hoặc 'answer'"},
-                        },
-                        "required": ["ref_id","ref_type"],
-                    },
-                },
-                "reason": {"type":"string","description":"Lý do áp dụng chung cho tất cả"},
+                "user_id": {"type":"string","description":"ID người dùng"},
             },
-            "required": ["items","reason"],
+            "required": ["user_id"],
         },
     },
     {
-        "name"       : "bulk_ban_users",
-        "description": "Cảnh báo hoặc khóa nhiều tài khoản cùng lúc",
+        "name"       : "get_user_warning_history",
+        "description": "Xem lịch sử CẢNH BÁO/leo thang mức vi phạm của 1 user (level 1→2→3 qua thời gian), tách riêng khỏi lịch sử nội dung bị xóa — dùng để đánh giá mức độ tái phạm trước khi quyết định ban/unban",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "user_ids": {"type":"array","items":{"type":"string"},"description":"Danh sách UUID user"},
-                "reason"  : {"type":"string"},
-                "level"   : {"type":"integer","description":"1=cảnh báo vàng, 2=nghiêm trọng đỏ, 3=khóa"},
+                "user_id": {"type":"string","description":"ID người dùng"},
             },
-            "required": ["user_ids","reason","level"],
+            "required": ["user_id"],
         },
-    },
-    {
-        "name"       : "get_appeal_detail",
-        "description": "Lấy đầy đủ nội dung 1 kháng cáo (nội dung hoặc tài khoản) không bị cắt ngắn, kèm thông tin nội dung/user liên quan — dùng trước khi approve/reject",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "appeal_id": {"type":"string"},
-            },
-            "required": ["appeal_id"],
-        },
-    },
-    {
-        "name"       : "get_violation_analytics",
-        "description": "Thống kê vi phạm: top user vi phạm nhiều nhất, số nội dung bị xóa theo loại, timeline vi phạm theo ngày",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "days": {"type":"integer","description":"Số ngày gần nhất để thống kê, mặc định 30"},
-            },
-        },
-    },
-    {
-        "name"       : "list_pending_reports",
-        "description": "Liệt kê báo cáo vi phạm đang chờ admin xử lý",
-        "inputSchema": {"type":"object","properties":{}},
-    },
-    {
-        "name"       : "list_pending_appeals",
-        "description": "Liệt kê kháng cáo nội dung (câu hỏi/câu trả lời) đang chờ admin duyệt",
-        "inputSchema": {"type":"object","properties":{}},
-    },
-    {
-        "name"       : "list_ban_appeals",
-        "description": "Liệt kê kháng cáo xóa/khóa tài khoản đang chờ xét duyệt",
-        "inputSchema": {"type":"object","properties":{}},
     },
     {
         "name"       : "get_content_detail",
@@ -233,41 +187,6 @@ MCP_TOOLS = [
         },
     },
     {
-        "name"       : "get_user_by_username",
-        "description": "Tra cứu user_id (UUID) từ username — dùng trước khi gọi ban_user/get_user_history",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "username": {"type":"string","description":"Tên đăng nhập, không cần @"},
-            },
-            "required": ["username"],
-        },
-    },
-    {
-        "name"       : "get_user_history",
-        "description": "Xem toàn bộ lịch sử vi phạm, câu hỏi/trả lời bị xóa của user — dùng để xét kháng cáo ban",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "user_id": {"type":"string","description":"ID người dùng"},
-            },
-            "required": ["user_id"],
-        },
-    },
-    {
-        "name"       : "search_users",
-        "description": "Tìm/lọc người dùng theo tên hoặc mức vi phạm — dùng để phát hiện tài khoản vi phạm lặp lại",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "username_like"  : {"type":"string","description":"Tìm gần đúng theo username (không bắt buộc)"},
-                "min_violation"  : {"type":"integer","description":"Lọc violation_level >= giá trị này (0-3, không bắt buộc)"},
-                "is_banned"      : {"type":"boolean","description":"Lọc theo trạng thái bị khóa (không bắt buộc)"},
-                "limit"          : {"type":"integer","description":"Số kết quả tối đa (mặc định 20, tối đa 50)"},
-            },
-        },
-    },
-    {
         "name"       : "approve_content",
         "description": "Duyệt nội dung — cho hiển thị",
         "inputSchema": {
@@ -282,7 +201,7 @@ MCP_TOOLS = [
     },
     {
         "name"       : "remove_content",
-        "description": "Xóa nội dung vi phạm",
+        "description": "Xóa mềm (soft delete) 1 nội dung vi phạm — có thể khôi phục trong 30 ngày qua restore_content",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -295,30 +214,78 @@ MCP_TOOLS = [
         },
     },
     {
-        "name"       : "bulk_remove_user_content",
-        "description": "Xóa nhiều câu hỏi/câu trả lời của 1 user cùng lúc — dùng khi phát hiện user vi phạm hàng loạt",
+        "name"       : "restore_content",
+        "description": "Khôi phục 1 nội dung đã bị xóa mềm trong vòng 30 ngày qua remove_content/bulk_remove_content",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "user_id" : {"type":"string"},
-                "reason"  : {"type":"string"},
-                "content_types": {"type":"string","description":"'question','answer','all' (mặc định 'all')"},
-                "limit"   : {"type":"integer","description":"Số nội dung tối đa xóa mỗi loại (mặc định 20, tối đa 50)"},
+                "ref_id"  : {"type":"string"},
+                "ref_type": {"type":"string"},
+                "reason"  : {"type":"string","description":"Lý do khôi phục"},
             },
-            "required": ["user_id","reason"],
+            "required": ["ref_id","ref_type"],
+        },
+    },
+    {
+        "name"       : "list_deleted_content",
+        "description": "Liệt kê nội dung đang ở trạng thái xóa mềm (còn trong 30 ngày, có thể restore) — dùng để rà soát trước khi phục hồi hoặc xóa vĩnh viễn",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "type": {"type":"string","description":"'question','answer','all' (mặc định 'all')"},
+            },
+        },
+    },
+    {
+        "name"       : "bulk_remove_content",
+        "description": "Xóa mềm NHIỀU nội dung cùng lúc, MỖI nội dung có lý do (reason) RIÊNG — không dùng chung 1 lý do cho tất cả. BẮT BUỘC phải gọi với confirm_token hợp lệ lấy từ request_bulk_action trước, trừ khi dry_run=true để xem trước danh sách sẽ bị ảnh hưởng.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "description": "Danh sách nội dung cần xóa, MỖI item có reason riêng",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "ref_id"  : {"type":"string"},
+                            "ref_type": {"type":"string","description":"'question' hoặc 'answer'"},
+                            "reason"  : {"type":"string","description":"Lý do XÓA RIÊNG cho nội dung này"},
+                        },
+                        "required": ["ref_id","ref_type","reason"],
+                    },
+                },
+                "confirm_token": {"type":"string","description":"Token xác nhận lấy từ request_bulk_action — bắt buộc trừ khi dry_run=true"},
+                "dry_run": {"type":"boolean","description":"true = chỉ xem trước sẽ xóa gì, KHÔNG thực thi, KHÔNG cần confirm_token"},
+            },
+            "required": ["items"],
         },
     },
     {
         "name"       : "bulk_ban_users",
-        "description": "Cảnh báo hoặc khóa nhiều user cùng lúc bằng cùng 1 lý do và mức độ",
+        "description": "Cảnh báo hoặc khóa NHIỀU user cùng lúc. BẮT BUỘC phải gọi với confirm_token hợp lệ lấy từ request_bulk_action trước, trừ khi dry_run=true để xem trước danh sách.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "user_ids": {"type":"array","items":{"type":"string"},"description":"Danh sách user_id"},
+                "user_ids": {"type":"array","items":{"type":"string"},"description":"Danh sách UUID user"},
                 "reason"  : {"type":"string"},
                 "level"   : {"type":"integer","description":"1=cảnh báo vàng, 2=nghiêm trọng đỏ, 3=khóa"},
+                "confirm_token": {"type":"string","description":"Token xác nhận lấy từ request_bulk_action — bắt buộc trừ khi dry_run=true"},
+                "dry_run": {"type":"boolean","description":"true = chỉ xem trước sẽ ảnh hưởng ai, KHÔNG thực thi, KHÔNG cần confirm_token"},
             },
             "required": ["user_ids","reason","level"],
+        },
+    },
+    {
+        "name"       : "request_bulk_action",
+        "description": "BƯỚC XÁC NHẬN bắt buộc trước khi chạy bulk_remove_content hoặc bulk_ban_users thật sự. Trả về confirm_token (hết hạn sau 5 phút) và bản tóm tắt số lượng/đối tượng sẽ bị ảnh hưởng để xác nhận lại trước khi thực thi.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type":"string","description":"'bulk_remove_content' hoặc 'bulk_ban_users'"},
+                "payload": {"type":"object","description":"Tham số sẽ dùng khi thực thi thật (items hoặc user_ids+reason+level)"},
+            },
+            "required": ["action","payload"],
         },
     },
     {
@@ -346,6 +313,16 @@ MCP_TOOLS = [
         },
     },
     {
+        "name"       : "list_pending_appeals",
+        "description": "Liệt kê kháng cáo nội dung (câu hỏi/câu trả lời) đang chờ admin duyệt",
+        "inputSchema": {"type":"object","properties":{}},
+    },
+    {
+        "name"       : "list_ban_appeals",
+        "description": "Liệt kê kháng cáo xóa/khóa tài khoản đang chờ xét duyệt",
+        "inputSchema": {"type":"object","properties":{}},
+    },
+    {
         "name"       : "approve_ban_appeal",
         "description": "Chấp nhận kháng cáo xóa/khóa tài khoản — mở khóa",
         "inputSchema": {
@@ -371,7 +348,7 @@ MCP_TOOLS = [
     },
     {
         "name"       : "get_appeal_detail",
-        "description": "Xem đầy đủ nội dung 1 kháng cáo (không bị cắt ngắn) — dùng trước khi approve/reject",
+        "description": "Xem đầy đủ nội dung 1 kháng cáo (nội dung hoặc tài khoản), không bị cắt ngắn, kèm bối cảnh liên quan — dùng trước khi approve/reject",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -392,6 +369,11 @@ MCP_TOOLS = [
             },
             "required": ["report_id","action_taken","reason"],
         },
+    },
+    {
+        "name"       : "list_pending_reports",
+        "description": "Liệt kê báo cáo vi phạm đang chờ admin xử lý",
+        "inputSchema": {"type":"object","properties":{}},
     },
     {
         "name"       : "ban_user",
@@ -419,17 +401,30 @@ MCP_TOOLS = [
         },
     },
     {
+        "name"       : "get_audit_log",
+        "description": "Xem lịch sử audit log — mọi hành động moderation đã thực hiện (xóa, ban, duyệt kháng cáo...), ai làm, khi nào, lý do gì. Dùng để truy vết/kiểm tra lại quyết định trước đó.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action"      : {"type":"string","description":"Lọc theo loại hành động, ví dụ 'remove_content','ban_user' (không bắt buộc)"},
+                "target_id"   : {"type":"string","description":"Lọc theo ID đối tượng cụ thể (không bắt buộc)"},
+                "days"        : {"type":"integer","description":"Số ngày gần nhất (mặc định 30)"},
+                "limit"       : {"type":"integer","description":"Số kết quả tối đa (mặc định 50)"},
+            },
+        },
+    },
+    {
         "name"       : "get_stats",
         "description": "Thống kê tổng quan hệ thống",
         "inputSchema": {"type":"object","properties":{}},
     },
     {
         "name"       : "get_violation_analytics",
-        "description": "Thống kê chi tiết vi phạm: top user vi phạm nhiều nhất, số nội dung xóa theo loại, timeline vi phạm gần đây",
+        "description": "Thống kê vi phạm: top user vi phạm nhiều nhất, số nội dung bị xóa theo loại, timeline vi phạm theo ngày",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "days": {"type":"integer","description":"Số ngày gần nhất cần thống kê (mặc định 7)"},
+                "days": {"type":"integer","description":"Số ngày gần nhất để thống kê, mặc định 30"},
             },
         },
     },
@@ -495,7 +490,6 @@ def execute_tool(tool: str, inp: dict) -> str:
                     f"⭐ {p.get('points',0)} điểm\n---"
                 )
             return "\n".join(lines)
-        # Không khớp chính xác → tìm gần đúng
         fuzzy = supabase.table("profiles")\
             .select("id,username,violation_level,is_banned")\
             .ilike("username",f"%{username}%").limit(10).execute()
@@ -519,7 +513,7 @@ def execute_tool(tool: str, inp: dict) -> str:
         limit         = int(inp.get("limit",30))
 
         q = supabase.table("profiles")\
-            .select("id,username,violation_level,is_banned,ban_reason,points,redemption_points")
+            .select("id,username,violation_level,is_banned,ban_reason,points")
         if username_like:
             q = q.ilike("username",f"%{username_like}%")
         if min_vl is not None:
@@ -538,263 +532,9 @@ def execute_tool(tool: str, inp: dict) -> str:
                 f"👤 {p['username']}\n"
                 f"📊 {vl_map.get(p.get('violation_level',0),'?')}"
                 + (f" - {p.get('ban_reason')}" if p.get('is_banned') and p.get('ban_reason') else "") + "\n"
-                f"⭐ {p.get('points',0)} điểm"
-                + (f" | 🔓 Chuộc: {p.get('redemption_points',0)}/100" if p.get('is_banned') else "") + "\n---"
+                f"⭐ {p.get('points',0)} điểm\n---"
             )
         return "\n".join(lines)
-
-    # ── bulk_remove_content ──────────────────────────────────────────────────
-    if tool == "bulk_remove_content":
-        items  = inp.get("items",[])
-        reason = inp.get("reason","Admin xóa hàng loạt")
-        if not items:
-            return "⚠️ Danh sách items rỗng."
-        results = []
-        for item in items:
-            r = execute_tool("remove_content", {
-                "ref_id": item.get("ref_id",""),
-                "ref_type": item.get("ref_type",""),
-                "reason": reason,
-            })
-            results.append(f"  • {item.get('ref_type')} `{item.get('ref_id','')[:8]}` → {r}")
-        return f"🚫 **Đã xử lý {len(items)} nội dung:**\n" + "\n".join(results)
-
-    # ── bulk_ban_users ────────────────────────────────────────────────────────
-    if tool == "bulk_ban_users":
-        user_ids = inp.get("user_ids",[])
-        reason   = inp.get("reason","")
-        level    = int(inp.get("level",1))
-        if not user_ids:
-            return "⚠️ Danh sách user_ids rỗng."
-        results = []
-        for uid in user_ids:
-            r = execute_tool("ban_user", {
-                "user_id": uid, "reason": reason, "level": level,
-            })
-            results.append(f"  • `{uid[:8]}` → {r}")
-        return f"⚖️ **Đã xử lý {len(user_ids)} user:**\n" + "\n".join(results)
-
-    # ── get_appeal_detail ─────────────────────────────────────────────────────
-    if tool == "get_appeal_detail":
-        appeal_id = inp.get("appeal_id","")
-        ap = supabase.table("appeals").select("*,profiles(username,violation_level,is_banned)")\
-            .eq("id",appeal_id).single().execute()
-        if not ap.data:
-            return "❌ Không tìm thấy kháng cáo."
-        a = ap.data
-        result = (
-            f"⚖️ **CHI TIẾT KHÁNG CÁO** `{a['id']}`\n"
-            f"👤 {a['profiles']['username'] if a.get('profiles') else a.get('user_id','?')[:8]}\n"
-            f"📌 Loại: {a.get('ref_type','?')}\n"
-            f"📊 Trạng thái: {a.get('status','?')}\n"
-            f"🕐 {a.get('created_at','')[:16]}\n\n"
-            f"📝 **Nội dung kháng cáo đầy đủ:**\n{a.get('content','(trống)')}\n"
-        )
-        if a.get('review_note'):
-            result += f"\n📋 Ghi chú admin trước đó: {a['review_note']}\n"
-        if a.get('ref_type') in ('question','answer') and a.get('ref_id'):
-            detail = execute_tool("get_content_detail", {
-                "ref_id": a['ref_id'], "ref_type": a['ref_type'],
-            })
-            result += f"\n──── Nội dung liên quan ────\n{detail}"
-        elif a.get('ref_type') == 'account':
-            history = execute_tool("get_user_history", {"user_id": a.get('user_id','')})
-            result += f"\n──── Lịch sử tài khoản ────\n{history}"
-        return result
-
-    # ── get_violation_analytics ──────────────────────────────────────────────
-    if tool == "get_violation_analytics":
-        days = int(inp.get("days",30))
-        since = (datetime.now(timezone.utc).timestamp() - days*86400)
-        since_iso = datetime.fromtimestamp(since,tz=timezone.utc).isoformat()
-
-        logs = supabase.table("moderation_logs")\
-            .select("user_id,ref_type,label,created_at,profiles(username)")\
-            .gte("created_at",since_iso)\
-            .order("created_at",desc=False).limit(500).execute()
-        ld = logs.data or []
-
-        if not ld:
-            return f"✅ Không có vi phạm nào trong {days} ngày qua."
-
-        top_users = Counter()
-        by_type   = Counter()
-        by_day    = Counter()
-        uname_map = {}
-        for l in ld:
-            uid = l.get("user_id","?")
-            top_users[uid] += 1
-            by_type[l.get("ref_type","?")] += 1
-            by_day[l.get("created_at","")[:10]] += 1
-            if l.get("profiles"):
-                uname_map[uid] = l["profiles"].get("username","?")
-
-        result = f"📊 **PHÂN TÍCH VI PHẠM ({days} ngày qua, {len(ld)} bản ghi)**\n\n"
-        result += "🔝 **Top 10 user vi phạm nhiều nhất:**\n"
-        for uid, cnt in top_users.most_common(10):
-            uname = uname_map.get(uid, uid[:8] if uid != "?" else "?")
-            result += f"  • {uname} (`{uid[:8]}`): {cnt} lần\n"
-
-        result += "\n📂 **Theo loại nội dung:**\n"
-        for t, cnt in by_type.most_common():
-            result += f"  • {t}: {cnt}\n"
-
-        result += "\n📅 **Timeline theo ngày (10 ngày gần nhất có vi phạm):**\n"
-        for day, cnt in sorted(by_day.items())[-10:]:
-            result += f"  • {day}: {cnt} vi phạm\n"
-
-        return result
-
-    # ── list_pending_reports ──────────────────────────────────────────────────
-    if tool == "list_pending_reports":
-        r = supabase.table("reports")\
-            .select("id,ref_id,ref_type,reason,detail,created_at,profiles(username)")\
-            .eq("status","processing")\
-            .order("created_at",desc=False).limit(20).execute()
-        if not r.data:
-            return "✅ Không có báo cáo nào đang chờ xử lý."
-        lines = [f"🚩 **{len(r.data)} báo cáo đang chờ:**\n"]
-        for rep in r.data:
-            lines.append(
-                f"🆔 `{rep['id']}`\n"
-                f"👤 {rep['profiles']['username'] if rep.get('profiles') else '?'}\n"
-                f"📌 {rep['ref_type']} | `{rep['ref_id']}`\n"
-                f"⚠️  {rep['reason']}\n"
-                f"📝 {rep.get('detail') or '(không có)'}\n"
-                f"🕐 {rep['created_at'][:16]}\n---"
-            )
-        return "\n".join(lines)
-
-    # ── list_pending_appeals ──────────────────────────────────────────────────
-    # Đồng bộ với appeal.php: bảng 'appeals' chứa CẢ kháng cáo nội dung
-    # (ref_type='question'/'answer') LẪN kháng cáo tài khoản (ref_type='account').
-    # Tool này chỉ lấy kháng cáo nội dung; kháng cáo tài khoản dùng list_ban_appeals.
-    if tool == "list_pending_appeals":
-        r = supabase.table("appeals")\
-            .select("id,user_id,ref_id,ref_type,content,created_at,profiles(username)")\
-            .eq("status","pending")\
-            .in_("ref_type",["question","answer"])\
-            .order("created_at",desc=False).limit(20).execute()
-        if not r.data:
-            return "✅ Không có kháng cáo nội dung nào đang chờ."
-        lines = [f"⚖️  **{len(r.data)} kháng cáo nội dung đang chờ:**\n"]
-        for a in r.data:
-            lines.append(
-                f"🆔 `{a['id']}`\n"
-                f"👤 {a['profiles']['username'] if a.get('profiles') else a['user_id'][:8]}\n"
-                f"📌 {a['ref_type']} | `{a['ref_id']}`\n"
-                f"💬 {a['content'][:300]}\n"
-                f"🕐 {a['created_at'][:16]}\n---"
-            )
-        return "\n".join(lines)
-
-    # ── list_ban_appeals ──────────────────────────────────────────────────────
-    # appeal.php (type=account, gọi từ banned.php) insert vào CÙNG bảng 'appeals'
-    # với ref_type='account' — không có bảng 'ban_appeals' riêng trong hệ PHP.
-    if tool == "list_ban_appeals":
-        r = supabase.table("appeals")\
-            .select("id,user_id,content,created_at,profiles(username,violation_level)")\
-            .eq("status","pending")\
-            .eq("ref_type","account")\
-            .order("created_at",desc=False).limit(20).execute()
-        if not r.data:
-            return "✅ Không có kháng cáo ban nào đang chờ."
-        lines = [f"🔒 **{len(r.data)} kháng cáo ban đang chờ:**\n"]
-        for a in r.data:
-            lines.append(
-                f"🆔 `{a['id']}`\n"
-                f"👤 {a['profiles']['username'] if a.get('profiles') else a['user_id'][:8]}\n"
-                f"📊 Mức vi phạm: {a['profiles']['violation_level'] if a.get('profiles') else '?'}\n"
-                f"💬 {a['content'][:300]}\n"
-                f"🕐 {a['created_at'][:16]}\n---"
-            )
-        return "\n".join(lines)
-
-    # ── get_content_detail ────────────────────────────────────────────────────
-    if tool == "get_content_detail":
-        ref_id   = inp.get("ref_id","")
-        ref_type = inp.get("ref_type","")
-        if ref_type == "question":
-            r = supabase.table("questions")\
-                .select("*,profiles(username)").eq("id",ref_id).single().execute()
-            if not r.data: return "Không tìm thấy câu hỏi."
-            q = r.data
-            return (
-                f"📚 **CÂU HỎI**\n🆔 `{q['id']}`\n"
-                f"👤 {q['profiles']['username'] if q.get('profiles') else '?'}\n"
-                f"📌 {q.get('grade_group','')} | {q.get('subject','')}\n"
-                f"📋 {q.get('title','')}\n"
-                f"📄 {q.get('body','') or '(không có)'}\n"
-                f"🖼️  {q.get('image_url') or '(không có ảnh)'}\n"
-                f"📊 {q.get('status','')} | 🚩 {q.get('removed_reason') or '(chưa gắn cờ)'}\n"
-                f"👁️  {q.get('views',0)} lượt | ⭐ {q.get('points_cost',0)} điểm\n"
-                f"🕐 {q.get('created_at','')[:16]}"
-            )
-        else:
-            r = supabase.table("answers")\
-                .select("*,profiles(username),questions(title)")\
-                .eq("id",ref_id).single().execute()
-            if not r.data: return "Không tìm thấy câu trả lời."
-            a = r.data
-            return (
-                f"💬 **CÂU TRẢ LỜI**\n🆔 `{a['id']}`\n"
-                f"👤 {a['profiles']['username'] if a.get('profiles') else '?'}\n"
-                f"❓ {a['questions']['title'] if a.get('questions') else a.get('question_id','')}\n"
-                f"📄 {a.get('body','')}\n"
-                f"🖼️  {a.get('image_url') or '(không có ảnh)'}\n"
-                f"📊 {a.get('moderation_status','')} | 🚩 {a.get('removed_reason') or '(chưa gắn cờ)'}\n"
-                f"🕐 {a.get('created_at','')[:16]}"
-            )
-
-    # ── get_question_by_answer_id ─────────────────────────────────────────────
-    if tool == "get_question_by_answer_id":
-        answer_id = inp.get("answer_id","").strip()
-        a = supabase.table("answers")\
-            .select("id,question_id,body,user_id,moderation_status,removed_reason,profiles(username)")\
-            .eq("id",answer_id).single().execute()
-        if not a.data: return "Không tìm thấy câu trả lời."
-        question_id = a.data.get("question_id")
-        if not question_id: return "Câu trả lời này không có question_id."
-        q = supabase.table("questions")\
-            .select("*,profiles(username)").eq("id",question_id).single().execute()
-        if not q.data: return f"Không tìm thấy câu hỏi cha."
-        qd, ad = q.data, a.data
-        return (
-            f"🔗 **Answer → Question**\n\n"
-            f"💬 **CÂU TRẢ LỜI** `{ad['id']}`\n"
-            f"👤 {ad['profiles']['username'] if ad.get('profiles') else '?'}\n"
-            f"📄 {ad.get('body','')[:200]}\n"
-            f"📊 {ad.get('moderation_status','')} | 🚩 {ad.get('removed_reason') or '(chưa gắn cờ)'}\n\n"
-            f"📚 **CÂU HỎI CHA** `{qd['id']}`\n"
-            f"👤 {qd['profiles']['username'] if qd.get('profiles') else '?'}\n"
-            f"📌 {qd.get('grade_group','')} | {qd.get('subject','')}\n"
-            f"📋 {qd.get('title','')}\n"
-            f"📄 {qd.get('body','') or '(không có)'}\n"
-            f"🖼️  {qd.get('image_url') or '(không có ảnh)'}\n"
-            f"📊 {qd.get('status','')} | 👁️  {qd.get('views',0)} lượt\n"
-            f"🕐 {qd.get('created_at','')[:16]}\n\n"
-            f"💡 remove_content ref_id=`{qd['id']}` ref_type='question' để xóa câu hỏi cha."
-        )
-
-    # ── get_user_by_username ──────────────────────────────────────────────────
-    if tool == "get_user_by_username":
-        username = inp.get("username","").strip().lstrip("@")
-        if not username: return "Vui lòng nhập username."
-        r = supabase.table("profiles")\
-            .select("id,username,violation_level,is_banned,ban_reason,points,redemption_points,created_at")\
-            .eq("username",username).limit(1).execute()
-        if not r.data:
-            return f"Không tìm thấy user có username '{username}'."
-        p = r.data[0]
-        vl_map = {0:"✅ Bình thường",1:"⚠️ Cảnh báo",2:"🔴 Nghiêm trọng",3:"🔒 Bị khóa"}
-        return (
-            f"👤 **{p['username']}**\n"
-            f"🆔 `{p['id']}`\n"
-            f"📊 {vl_map.get(p.get('violation_level',0),'?')}\n"
-            f"🔒 Bị khóa: {'Có - '+(p.get('ban_reason') or '?') if p.get('is_banned') else 'Không'}\n"
-            f"⭐ Điểm: {p.get('points',0)} | Điểm chuộc: {p.get('redemption_points',0)}/100\n"
-            f"🕐 Tham gia: {(p.get('created_at') or '')[:10]}"
-        )
 
     # ── get_user_history ──────────────────────────────────────────────────────
     if tool == "get_user_history":
@@ -839,32 +579,109 @@ def execute_tool(tool: str, inp: dict) -> str:
                 result += f"  [{l['ref_type']}] {l['label']}: {l['reason']} ({l['created_at'][:10]})\n"
         return result
 
-    # ── search_users ──────────────────────────────────────────────────────────
-    if tool == "search_users":
-        limit = min(int(inp.get("limit",20) or 20), 50)
-        q = supabase.table("profiles")\
-            .select("id,username,violation_level,is_banned,points,created_at")
-        username_like = (inp.get("username_like") or "").strip()
-        if username_like:
-            q = q.ilike("username", f"%{username_like}%")
-        min_violation = inp.get("min_violation")
-        if min_violation is not None:
-            q = q.gte("violation_level", int(min_violation))
-        is_banned = inp.get("is_banned")
-        if is_banned is not None:
-            q = q.eq("is_banned", bool(is_banned))
-        r = q.order("violation_level",desc=True).limit(limit).execute()
-        if not r.data:
-            return "Không tìm thấy user nào khớp điều kiện."
-        vl_map = {0:"✅",1:"⚠️",2:"🔴",3:"🔒"}
-        lines = [f"👥 **{len(r.data)} user tìm thấy:**\n"]
-        for p in r.data:
-            lines.append(
-                f"{vl_map.get(p.get('violation_level',0),'?')} **{p['username']}** "
-                f"`{p['id'][:8]}` | mức {p.get('violation_level',0)} | "
-                f"{'khóa' if p.get('is_banned') else 'hoạt động'} | {p.get('points',0)} điểm"
+    # ── get_user_warning_history ─────────────────────────────────────────────
+    # Khác get_user_history: tập trung riêng vào việc LEO THANG mức vi phạm
+    # (level 1→2→3) qua các lần ban_user, lấy từ audit_logs thay vì moderation_logs
+    # vì moderation_logs chỉ ghi vi phạm nội dung tự động, không ghi quyết định ban của admin.
+    if tool == "get_user_warning_history":
+        user_id = inp.get("user_id","")
+        profile = supabase.table("profiles")\
+            .select("username,violation_level,is_banned,ban_reason")\
+            .eq("id",user_id).single().execute()
+        p = profile.data or {}
+
+        audits = supabase.table("audit_logs")\
+            .select("action,reason,metadata,created_at")\
+            .eq("target_type","user").eq("target_id",user_id)\
+            .in_("action",["ban_user","unban_user"])\
+            .order("created_at",desc=False).limit(50).execute()
+
+        result = (
+            f"📖 **LỊCH SỬ CẢNH BÁO** — {p.get('username','?')} (`{user_id[:8]}`)\n"
+            f"Mức hiện tại: {p.get('violation_level',0)} | "
+            f"{'🔒 Đang bị khóa' if p.get('is_banned') else '✅ Bình thường'}\n\n"
+        )
+        if not audits.data:
+            result += "Chưa có lịch sử cảnh báo/ban nào được ghi nhận qua audit log."
+            return result
+
+        result += "**Diễn biến theo thời gian:**\n"
+        for a in audits.data:
+            meta = a.get("metadata") or {}
+            if a["action"] == "ban_user":
+                lvl = meta.get("level","?")
+                result += f"  🔺 [{a['created_at'][:16]}] Nâng lên MỨC {lvl} — Lý do: {a.get('reason','')}\n"
+            else:
+                result += f"  🔻 [{a['created_at'][:16]}] MỞ KHÓA (reset về mức 0) — Lý do: {a.get('reason','')}\n"
+        return result
+
+    # ── get_content_detail ────────────────────────────────────────────────────
+    if tool == "get_content_detail":
+        ref_id   = inp.get("ref_id","")
+        ref_type = inp.get("ref_type","")
+        if ref_type == "question":
+            r = supabase.table("questions")\
+                .select("*,profiles(username)").eq("id",ref_id).single().execute()
+            if not r.data: return "Không tìm thấy câu hỏi."
+            q = r.data
+            return (
+                f"📚 **CÂU HỎI**\n🆔 `{q['id']}`\n"
+                f"👤 {q['profiles']['username'] if q.get('profiles') else '?'}\n"
+                f"📌 {q.get('grade_group','')} | {q.get('subject','')}\n"
+                f"📋 {q.get('title','')}\n"
+                f"📄 {q.get('body','') or '(không có)'}\n"
+                f"🖼️  {q.get('image_url') or '(không có ảnh)'}\n"
+                f"📊 {q.get('status','')} | 🚩 {q.get('removed_reason') or '(chưa gắn cờ)'}\n"
+                f"👁️  {q.get('views',0)} lượt | ⭐ {q.get('points_cost',0)} điểm\n"
+                f"🗑️  Xóa mềm: {'Có, lúc ' + q['deleted_at'][:16] if q.get('deleted_at') else 'Không'}\n"
+                f"🕐 {q.get('created_at','')[:16]}"
             )
-        return "\n".join(lines)
+        else:
+            r = supabase.table("answers")\
+                .select("*,profiles(username),questions(title)")\
+                .eq("id",ref_id).single().execute()
+            if not r.data: return "Không tìm thấy câu trả lời."
+            a = r.data
+            return (
+                f"💬 **CÂU TRẢ LỜI**\n🆔 `{a['id']}`\n"
+                f"👤 {a['profiles']['username'] if a.get('profiles') else '?'}\n"
+                f"❓ {a['questions']['title'] if a.get('questions') else a.get('question_id','')}\n"
+                f"📄 {a.get('body','')}\n"
+                f"🖼️  {a.get('image_url') or '(không có ảnh)'}\n"
+                f"📊 {a.get('moderation_status','')} | 🚩 {a.get('removed_reason') or '(chưa gắn cờ)'}\n"
+                f"🗑️  Xóa mềm: {'Có, lúc ' + a['deleted_at'][:16] if a.get('deleted_at') else 'Không'}\n"
+                f"🕐 {a.get('created_at','')[:16]}"
+            )
+
+    # ── get_question_by_answer_id ─────────────────────────────────────────────
+    if tool == "get_question_by_answer_id":
+        answer_id = inp.get("answer_id","").strip()
+        a = supabase.table("answers")\
+            .select("id,question_id,body,user_id,moderation_status,removed_reason,profiles(username)")\
+            .eq("id",answer_id).single().execute()
+        if not a.data: return "Không tìm thấy câu trả lời."
+        question_id = a.data.get("question_id")
+        if not question_id: return "Câu trả lời này không có question_id."
+        q = supabase.table("questions")\
+            .select("*,profiles(username)").eq("id",question_id).single().execute()
+        if not q.data: return f"Không tìm thấy câu hỏi cha."
+        qd, ad = q.data, a.data
+        return (
+            f"🔗 **Answer → Question**\n\n"
+            f"💬 **CÂU TRẢ LỜI** `{ad['id']}`\n"
+            f"👤 {ad['profiles']['username'] if ad.get('profiles') else '?'}\n"
+            f"📄 {ad.get('body','')[:200]}\n"
+            f"📊 {ad.get('moderation_status','')} | 🚩 {ad.get('removed_reason') or '(chưa gắn cờ)'}\n\n"
+            f"📚 **CÂU HỎI CHA** `{qd['id']}`\n"
+            f"👤 {qd['profiles']['username'] if qd.get('profiles') else '?'}\n"
+            f"📌 {qd.get('grade_group','')} | {qd.get('subject','')}\n"
+            f"📋 {qd.get('title','')}\n"
+            f"📄 {qd.get('body','') or '(không có)'}\n"
+            f"🖼️  {qd.get('image_url') or '(không có ảnh)'}\n"
+            f"📊 {qd.get('status','')} | 👁️  {qd.get('views',0)} lượt\n"
+            f"🕐 {qd.get('created_at','')[:16]}\n\n"
+            f"💡 remove_content ref_id=`{qd['id']}` ref_type='question' để xóa câu hỏi cha."
+        )
 
     # ── approve_content ───────────────────────────────────────────────────────
     if tool == "approve_content":
@@ -898,118 +715,163 @@ def execute_tool(tool: str, inp: dict) -> str:
                 "✅ Câu trả lời được duyệt",
                 f'Câu trả lời được admin duyệt. Lý do: {reason}',
                 ref_id,"answer")
+        _audit("approve_content", "question" if ref_type=="question" else "answer", ref_id, reason)
         return f"✅ Đã duyệt {ref_type} `{ref_id[:8]}`."
 
-    # ── remove_content ────────────────────────────────────────────────────────
+    # ── remove_content (SOFT DELETE) ─────────────────────────────────────────
     if tool == "remove_content":
         ref_id    = inp.get("ref_id","")
         ref_type  = inp.get("ref_type","")
         reason    = inp.get("reason","Admin xóa vi phạm")
         report_id = inp.get("report_id","")
-        if ref_type == "question":
-            r = supabase.table("questions").select("user_id,points_cost,title")\
-                .eq("id",ref_id).single().execute()
-            if not r.data: return "Không tìm thấy câu hỏi."
-            supabase.table("questions").update({
-                "status":"removed","removed_by_ai":True,
-                "removed_reason":f"Admin: {reason}",
-            }).eq("id",ref_id).execute()
-            _refund_points(r.data["user_id"],r.data.get("points_cost",0),ref_id)
-            _log_violation(r.data["user_id"],ref_id,"question","REMOVED",f"Admin: {reason}")
-            send_notification(r.data["user_id"],"content_removed",
-                "⚠️ Câu hỏi bị xóa bởi Admin",
-                f'Câu hỏi "{r.data.get("title","")[:50]}" bị Admin xóa. Lý do: {reason}. Bạn có thể kháng cáo.',
-                ref_id,"question")
-        else:
-            r = supabase.table("answers").select("user_id,body")\
-                .eq("id",ref_id).single().execute()
-            if not r.data: return "Không tìm thấy câu trả lời."
-            supabase.table("answers").update({
-                "moderation_status":"removed","removed_by_ai":True,
-                "removed_reason":f"Admin: {reason}",
-                "removed_content":r.data.get("body","")[:1000],
-            }).eq("id",ref_id).execute()
-            _log_violation(r.data["user_id"],ref_id,"answer","REMOVED",f"Admin: {reason}")
-            send_notification(r.data["user_id"],"content_removed",
-                "⚠️ Câu trả lời bị xóa bởi Admin",
-                f'Câu trả lời bị Admin xóa. Lý do: {reason}. Bạn có thể kháng cáo.',
-                ref_id,"answer")
+        result = _soft_delete_one(ref_id, ref_type, reason)
         if report_id:
             supabase.table("reports").update({"status":"resolved"})\
                 .eq("id",report_id).execute()
-        return f"🚫 Đã xóa {ref_type} `{ref_id[:8]}`."
+        return result
 
-    # ── bulk_remove_user_content ─────────────────────────────────────────────
-    if tool == "bulk_remove_user_content":
-        user_id       = inp.get("user_id","")
-        reason        = inp.get("reason","Admin xóa hàng loạt")
-        content_types = inp.get("content_types","all")
-        limit         = min(int(inp.get("limit",20) or 20), 50)
-        removed_q, removed_a = [], []
+    # ── restore_content ───────────────────────────────────────────────────────
+    if tool == "restore_content":
+        ref_id   = inp.get("ref_id","")
+        ref_type = inp.get("ref_type","")
+        reason   = inp.get("reason","Admin khôi phục")
+        return _restore_one(ref_id, ref_type, reason)
 
-        if content_types in ("question","all"):
-            qs = supabase.table("questions").select("id,points_cost,title")\
-                .eq("user_id",user_id).in_("status",["open","pending"]).limit(limit).execute()
-            for q in (qs.data or []):
-                supabase.table("questions").update({
-                    "status":"removed","removed_by_ai":True,
-                    "removed_reason":f"Admin (bulk): {reason}",
-                }).eq("id",q["id"]).execute()
-                _refund_points(user_id,q.get("points_cost",0),q["id"])
-                _log_violation(user_id,q["id"],"question","REMOVED",f"Admin (bulk): {reason}")
-                removed_q.append(q["id"])
+    # ── list_deleted_content ──────────────────────────────────────────────────
+    if tool == "list_deleted_content":
+        ctype = inp.get("type","all")
+        lines = []
+        if ctype in ("question","all"):
+            r = supabase.table("questions")\
+                .select("id,title,user_id,deleted_at,deleted_by,removed_reason,profiles(username)")\
+                .not_.is_("deleted_at","null")\
+                .order("deleted_at",desc=True).limit(30).execute()
+            if r.data:
+                lines.append(f"📚 **{len(r.data)} CÂU HỎI đã xóa mềm (còn khôi phục được):**\n")
+                for q in r.data:
+                    lines.append(
+                        f"🆔 `{q['id']}`\n"
+                        f"👤 {q['profiles']['username'] if q.get('profiles') else '?'}\n"
+                        f"📋 {q.get('title','')[:100]}\n"
+                        f"🚩 {q.get('removed_reason','')}\n"
+                        f"🗑️  Xóa lúc {q.get('deleted_at','')[:16]} bởi {q.get('deleted_by','?')}\n---"
+                    )
+        if ctype in ("answer","all"):
+            r = supabase.table("answers")\
+                .select("id,body,user_id,deleted_at,deleted_by,removed_reason,profiles(username)")\
+                .not_.is_("deleted_at","null")\
+                .order("deleted_at",desc=True).limit(30).execute()
+            if r.data:
+                lines.append(f"\n💬 **{len(r.data)} CÂU TRẢ LỜI đã xóa mềm:**\n")
+                for a in r.data:
+                    lines.append(
+                        f"🆔 `{a['id']}`\n"
+                        f"👤 {a['profiles']['username'] if a.get('profiles') else '?'}\n"
+                        f"📄 {a.get('body','')[:100]}\n"
+                        f"🚩 {a.get('removed_reason','')}\n"
+                        f"🗑️  Xóa lúc {a.get('deleted_at','')[:16]} bởi {a.get('deleted_by','?')}\n---"
+                    )
+        return "\n".join(lines) if lines else "✅ Không có nội dung nào đang ở trạng thái xóa mềm."
 
-        if content_types in ("answer","all"):
-            ans = supabase.table("answers").select("id,body")\
-                .eq("user_id",user_id).in_("moderation_status",["approved","pending"]).limit(limit).execute()
-            for a in (ans.data or []):
-                supabase.table("answers").update({
-                    "moderation_status":"removed","removed_by_ai":True,
-                    "removed_reason":f"Admin (bulk): {reason}",
-                    "removed_content":a.get("body","")[:1000],
-                }).eq("id",a["id"]).execute()
-                _log_violation(user_id,a["id"],"answer","REMOVED",f"Admin (bulk): {reason}")
-                removed_a.append(a["id"])
+    # ── request_bulk_action (CONFIRM STEP) ───────────────────────────────────
+    if tool == "request_bulk_action":
+        action  = inp.get("action","")
+        payload = inp.get("payload",{})
+        if action not in ("bulk_remove_content","bulk_ban_users"):
+            return "⚠️ action không hợp lệ. Chỉ hỗ trợ 'bulk_remove_content' hoặc 'bulk_ban_users'."
 
-        if removed_q or removed_a:
-            send_notification(user_id,"content_removed",
-                "⚠️ Nhiều nội dung bị xóa bởi Admin",
-                f'{len(removed_q)} câu hỏi và {len(removed_a)} câu trả lời của bạn bị Admin xóa. '
-                f'Lý do: {reason}. Bạn có thể kháng cáo từng nội dung.',
-                None,None)
+        token = secrets.token_urlsafe(16)
+        _pending_confirms[token] = {
+            "action": action,
+            "payload": payload,
+            "expires": time.time() + CONFIRM_TTL_SECONDS,
+        }
+        # dọn token hết hạn cũ
+        for k in [k for k,v in _pending_confirms.items() if v["expires"] < time.time()]:
+            del _pending_confirms[k]
+
+        if action == "bulk_remove_content":
+            items = payload.get("items",[])
+            summary = f"Sẽ XÓA MỀM {len(items)} nội dung:\n"
+            for it in items[:20]:
+                summary += f"  • {it.get('ref_type')} `{it.get('ref_id','')[:8]}` — lý do: {it.get('reason','(chưa có)')}\n"
+            if len(items) > 20:
+                summary += f"  ... và {len(items)-20} nội dung khác\n"
+        else:
+            user_ids = payload.get("user_ids",[])
+            level = payload.get("level","?")
+            reason = payload.get("reason","")
+            summary = f"Sẽ áp dụng MỨC {level} cho {len(user_ids)} user, lý do chung: {reason}\n"
+            for uid in user_ids[:20]:
+                summary += f"  • `{uid[:8]}`\n"
+            if len(user_ids) > 20:
+                summary += f"  ... và {len(user_ids)-20} user khác\n"
 
         return (
-            f"🚫 Đã xóa {len(removed_q)} câu hỏi và {len(removed_a)} câu trả lời "
-            f"của user `{user_id[:8]}`."
+            f"📋 **XÁC NHẬN TRƯỚC KHI THỰC THI**\n\n{summary}\n"
+            f"🔑 confirm_token: `{token}` (hết hạn sau {CONFIRM_TTL_SECONDS//60} phút)\n\n"
+            f"Để thực thi thật, gọi lại `{action}` với đúng payload này VÀ kèm confirm_token ở trên.\n"
+            f"Hoặc gọi với dry_run=true bất cứ lúc nào để xem trước mà không cần token."
         )
 
-    # ── bulk_ban_users ────────────────────────────────────────────────────────
+    # ── bulk_remove_content (reason riêng + confirm step) ────────────────────
+    if tool == "bulk_remove_content":
+        items         = inp.get("items",[])
+        confirm_token = inp.get("confirm_token","")
+        dry_run       = bool(inp.get("dry_run",False))
+        if not items:
+            return "⚠️ Danh sách items rỗng."
+        missing_reason = [it for it in items if not it.get("reason","").strip()]
+        if missing_reason:
+            return (f"⚠️ {len(missing_reason)} item thiếu 'reason' riêng. "
+                     f"Mỗi nội dung xóa hàng loạt PHẢI có lý do riêng, không dùng chung 1 lý do.")
+
+        if dry_run:
+            lines = [f"👁️ **DRY RUN — sẽ xóa {len(items)} nội dung (chưa thực thi):**\n"]
+            for it in items:
+                lines.append(f"  • {it['ref_type']} `{it['ref_id'][:8]}` — {it['reason']}")
+            return "\n".join(lines)
+
+        if not _check_confirm_token(confirm_token, "bulk_remove_content", {"items": items}):
+            return ("⛔ Thiếu hoặc sai confirm_token. Gọi request_bulk_action với "
+                     "action='bulk_remove_content' và payload={'items': [...]} giống hệt lần này trước, "
+                     "rồi dùng confirm_token trả về để thực thi. Hoặc dùng dry_run=true để xem trước.")
+
+        results = []
+        for item in items:
+            r = _soft_delete_one(item.get("ref_id",""), item.get("ref_type",""), item.get("reason",""))
+            results.append(f"  • {item.get('ref_type')} `{item.get('ref_id','')[:8]}` → {r}")
+        _audit("bulk_remove_content", "batch", None, f"{len(items)} nội dung", {"count": len(items)})
+        return f"🚫 **Đã xử lý {len(items)} nội dung:**\n" + "\n".join(results)
+
+    # ── bulk_ban_users (confirm step) ────────────────────────────────────────
     if tool == "bulk_ban_users":
-        user_ids = inp.get("user_ids") or []
-        reason   = inp.get("reason","")
-        level    = int(inp.get("level",1))
-        is_ban   = level >= 3
-        level_vi = {1:"Cảnh báo",2:"Nghiêm trọng",3:"Khóa tài khoản"}
-        ok, failed = [], []
+        user_ids      = inp.get("user_ids",[])
+        reason        = inp.get("reason","")
+        level         = int(inp.get("level",1))
+        confirm_token = inp.get("confirm_token","")
+        dry_run       = bool(inp.get("dry_run",False))
+        if not user_ids:
+            return "⚠️ Danh sách user_ids rỗng."
+
+        if dry_run:
+            lines = [f"👁️ **DRY RUN — sẽ áp mức {level} cho {len(user_ids)} user (chưa thực thi):**\n"]
+            for uid in user_ids:
+                lines.append(f"  • `{uid[:8]}`")
+            return "\n".join(lines)
+
+        payload = {"user_ids": user_ids, "reason": reason, "level": level}
+        if not _check_confirm_token(confirm_token, "bulk_ban_users", payload):
+            return ("⛔ Thiếu hoặc sai confirm_token. Gọi request_bulk_action với "
+                     "action='bulk_ban_users' và payload giống hệt lần này trước, "
+                     "rồi dùng confirm_token trả về để thực thi. Hoặc dùng dry_run=true để xem trước.")
+
+        results = []
         for uid in user_ids:
-            try:
-                supabase.table("profiles").update({
-                    "violation_level": level,
-                    "is_banned"      : is_ban,
-                    "ban_reason"     : reason,
-                }).eq("id",uid).execute()
-                send_notification(uid,"content_removed",
-                    f"⚠️ Tài khoản bị {'khóa' if is_ban else 'cảnh báo'}",
-                    f'Tài khoản ở mức {level_vi.get(level,"?")}. Lý do: {reason}. '
-                    f'{"Bạn có thể kháng cáo." if is_ban else "Hãy tuân thủ quy tắc cộng đồng."}',
-                    None,None)
-                ok.append(uid)
-            except Exception as e:
-                failed.append(uid)
-        result = f"✅ Đã xử lý {len(ok)}/{len(user_ids)} user ở mức {level} ({'khóa' if is_ban else 'cảnh báo'})."
-        if failed:
-            result += f"\n❌ Lỗi với {len(failed)} user: " + ", ".join(u[:8] for u in failed)
-        return result
+            r = _ban_user_internal(uid, reason, level)
+            results.append(f"  • `{uid[:8]}` → {r}")
+        _audit("bulk_ban_users", "batch", None, reason, {"count": len(user_ids), "level": level})
+        return f"⚖️ **Đã xử lý {len(user_ids)} user:**\n" + "\n".join(results)
 
     # ── approve_appeal (chỉ kháng cáo nội dung: question/answer) ────────────────
     if tool == "approve_appeal":
@@ -1025,21 +887,14 @@ def execute_tool(tool: str, inp: dict) -> str:
             "reviewed_at":datetime.now(timezone.utc).isoformat(),
         }).eq("id",appeal_id).execute()
         if a["ref_type"] == "question":
-            q = supabase.table("questions").select("user_id,points_cost")\
-                .eq("id",a["ref_id"]).single().execute()
-            supabase.table("questions").update({
-                "status":"open","removed_by_ai":False,"removed_reason":None,
-            }).eq("id",a["ref_id"]).execute()
-            if q.data and q.data.get("points_cost"):
-                _refund_points(q.data["user_id"],q.data["points_cost"],a["ref_id"])
+            _restore_one(a["ref_id"], "question", reason)
         else:
-            supabase.table("answers").update({
-                "moderation_status":"approved","removed_by_ai":False,"removed_reason":None,
-            }).eq("id",a["ref_id"]).execute()
+            _restore_one(a["ref_id"], "answer", reason)
         send_notification(a["user_id"],"appeal_approved",
             "✅ Kháng cáo thành công! (Admin duyệt)",
             f'Admin chấp nhận kháng cáo. Nội dung khôi phục. Lý do: {reason}',
             a["ref_id"],a["ref_type"],appeal_id)
+        _audit("approve_appeal", "appeal", appeal_id, reason)
         return f"✅ Đã chấp nhận kháng cáo `{appeal_id[:8]}`."
 
     # ── reject_appeal (chỉ kháng cáo nội dung: question/answer) ─────────────────
@@ -1058,7 +913,48 @@ def execute_tool(tool: str, inp: dict) -> str:
             "❌ Kháng cáo không thành công (Admin duyệt)",
             f'Admin không chấp nhận kháng cáo. Lý do: {reason}',
             ap.data["ref_id"],ap.data["ref_type"],appeal_id)
+        _audit("reject_appeal", "appeal", appeal_id, reason)
         return f"❌ Đã từ chối kháng cáo `{appeal_id[:8]}`."
+
+    # ── list_pending_appeals ──────────────────────────────────────────────────
+    if tool == "list_pending_appeals":
+        r = supabase.table("appeals")\
+            .select("id,user_id,ref_id,ref_type,content,created_at,profiles(username)")\
+            .eq("status","pending")\
+            .in_("ref_type",["question","answer"])\
+            .order("created_at",desc=False).limit(20).execute()
+        if not r.data:
+            return "✅ Không có kháng cáo nội dung nào đang chờ."
+        lines = [f"⚖️  **{len(r.data)} kháng cáo nội dung đang chờ:**\n"]
+        for a in r.data:
+            lines.append(
+                f"🆔 `{a['id']}`\n"
+                f"👤 {a['profiles']['username'] if a.get('profiles') else a['user_id'][:8]}\n"
+                f"📌 {a['ref_type']} | `{a['ref_id']}`\n"
+                f"💬 {a['content'][:300]}\n"
+                f"🕐 {a['created_at'][:16]}\n---"
+            )
+        return "\n".join(lines)
+
+    # ── list_ban_appeals ──────────────────────────────────────────────────────
+    if tool == "list_ban_appeals":
+        r = supabase.table("appeals")\
+            .select("id,user_id,content,created_at,profiles(username,violation_level)")\
+            .eq("status","pending")\
+            .eq("ref_type","account")\
+            .order("created_at",desc=False).limit(20).execute()
+        if not r.data:
+            return "✅ Không có kháng cáo ban nào đang chờ."
+        lines = [f"🔒 **{len(r.data)} kháng cáo ban đang chờ:**\n"]
+        for a in r.data:
+            lines.append(
+                f"🆔 `{a['id']}`\n"
+                f"👤 {a['profiles']['username'] if a.get('profiles') else a['user_id'][:8]}\n"
+                f"📊 Mức vi phạm: {a['profiles']['violation_level'] if a.get('profiles') else '?'}\n"
+                f"💬 {a['content'][:300]}\n"
+                f"🕐 {a['created_at'][:16]}\n---"
+            )
+        return "\n".join(lines)
 
     # ── approve_ban_appeal (chỉ kháng cáo tài khoản: ref_type='account') ────────
     if tool == "approve_ban_appeal":
@@ -1076,12 +972,12 @@ def execute_tool(tool: str, inp: dict) -> str:
             "violation_level"   : 0,
             "is_banned"         : False,
             "ban_reason"        : None,
-            "redemption_points" : 0,
         }).eq("id",ap.data["user_id"]).execute()
         send_notification(ap.data["user_id"],"appeal_approved",
             "✅ Tài khoản đã được mở khóa!",
             f'Kháng cáo của bạn được chấp nhận. Tài khoản đã mở khóa. Lý do: {reason}',
             None,None,appeal_id)
+        _audit("approve_ban_appeal", "appeal", appeal_id, reason, {"user_id": ap.data["user_id"]})
         return f"✅ Đã mở khóa tài khoản user `{ap.data['user_id'][:8]}`."
 
     # ── reject_ban_appeal (chỉ kháng cáo tài khoản: ref_type='account') ─────────
@@ -1100,29 +996,35 @@ def execute_tool(tool: str, inp: dict) -> str:
             "❌ Kháng cáo tài khoản không thành công",
             f'Kháng cáo bị từ chối. Tài khoản vẫn bị khóa. Lý do: {reason}',
             None,None,appeal_id)
+        _audit("reject_ban_appeal", "appeal", appeal_id, reason, {"user_id": ap.data["user_id"]})
         return f"❌ Đã từ chối kháng cáo ban `{appeal_id[:8]}`."
 
     # ── get_appeal_detail ─────────────────────────────────────────────────────
     if tool == "get_appeal_detail":
         appeal_id = inp.get("appeal_id","")
-        ap = supabase.table("appeals").select("*,profiles(username)")\
+        ap = supabase.table("appeals").select("*,profiles(username,violation_level,is_banned)")\
             .eq("id",appeal_id).single().execute()
-        if not ap.data: return "Không tìm thấy kháng cáo."
+        if not ap.data:
+            return "❌ Không tìm thấy kháng cáo."
         a = ap.data
-        kind = "🔒 Kháng cáo tài khoản" if a["ref_type"] == "account" else "⚖️ Kháng cáo nội dung"
         result = (
-            f"{kind}\n🆔 `{a['id']}`\n"
-            f"👤 {a['profiles']['username'] if a.get('profiles') else a['user_id'][:8]}\n"
+            f"⚖️ **CHI TIẾT KHÁNG CÁO** `{a['id']}`\n"
+            f"👤 {a['profiles']['username'] if a.get('profiles') else a.get('user_id','?')[:8]}\n"
+            f"📌 Loại: {a.get('ref_type','?')}\n"
+            f"📊 Trạng thái: {a.get('status','?')}\n"
+            f"🕐 {a.get('created_at','')[:16]}\n\n"
+            f"📝 **Nội dung kháng cáo đầy đủ:**\n{a.get('content','(trống)')}\n"
         )
-        if a["ref_type"] != "account":
-            result += f"📌 {a['ref_type']} | `{a.get('ref_id','')}`\n"
-        result += (
-            f"📊 Trạng thái: {a.get('status','')}\n"
-            f"💬 Nội dung đầy đủ:\n{a.get('content','')}\n"
-            f"🕐 {a.get('created_at','')[:16]}"
-        )
-        if a.get("review_note"):
-            result += f"\n📝 Ghi chú duyệt trước đó: {a['review_note']}"
+        if a.get('review_note'):
+            result += f"\n📋 Ghi chú admin trước đó: {a['review_note']}\n"
+        if a.get('ref_type') in ('question','answer') and a.get('ref_id'):
+            detail = execute_tool("get_content_detail", {
+                "ref_id": a['ref_id'], "ref_type": a['ref_type'],
+            })
+            result += f"\n──── Nội dung liên quan ────\n{detail}"
+        elif a.get('ref_type') == 'account':
+            history = execute_tool("get_user_history", {"user_id": a.get('user_id','')})
+            result += f"\n──── Lịch sử tài khoản ────\n{history}"
         return result
 
     # ── resolve_report ────────────────────────────────────────────────────────
@@ -1136,7 +1038,6 @@ def execute_tool(tool: str, inp: dict) -> str:
         r = rep.data
         supabase.table("reports").update({"status":"resolved"})\
             .eq("id",report_id).execute()
-        # Mở tạm khóa nội dung nếu không vi phạm
         if not action_taken:
             if r["ref_type"] == "question":
                 supabase.table("questions")\
@@ -1152,33 +1053,35 @@ def execute_tool(tool: str, inp: dict) -> str:
             send_notification(r["reporter_id"],"report_resolved",
                 "✅ Báo cáo đã được xử lý" if action_taken else "ℹ️ Báo cáo đã được xem xét",
                 msg, r["ref_id"],r["ref_type"])
+        _audit("resolve_report", r["ref_type"], r["ref_id"], reason, {"action_taken": action_taken})
         return f"✅ Đã resolve report `{report_id[:8]}`."
+
+    # ── list_pending_reports ──────────────────────────────────────────────────
+    if tool == "list_pending_reports":
+        r = supabase.table("reports")\
+            .select("id,ref_id,ref_type,reason,detail,created_at,profiles(username)")\
+            .eq("status","processing")\
+            .order("created_at",desc=False).limit(20).execute()
+        if not r.data:
+            return "✅ Không có báo cáo nào đang chờ xử lý."
+        lines = [f"🚩 **{len(r.data)} báo cáo đang chờ:**\n"]
+        for rep in r.data:
+            lines.append(
+                f"🆔 `{rep['id']}`\n"
+                f"👤 {rep['profiles']['username'] if rep.get('profiles') else '?'}\n"
+                f"📌 {rep['ref_type']} | `{rep['ref_id']}`\n"
+                f"⚠️  {rep['reason']}\n"
+                f"📝 {rep.get('detail') or '(không có)'}\n"
+                f"🕐 {rep['created_at'][:16]}\n---"
+            )
+        return "\n".join(lines)
 
     # ── ban_user ──────────────────────────────────────────────────────────────
     if tool == "ban_user":
         user_id = inp.get("user_id","")
         reason  = inp.get("reason","")
         level   = int(inp.get("level",1))
-        is_ban  = level >= 3
-        # Nối thêm lý do mới vào lịch sử thay vì ghi đè, để user thấy đủ các lần vi phạm
-        p = supabase.table("profiles").select("ban_reason")\
-            .eq("id",user_id).single().execute()
-        old_reason = (p.data or {}).get("ban_reason") or ""
-        today = datetime.now(timezone.utc).strftime("%d/%m/%Y")
-        new_entry = f"[{today}] {reason}"
-        combined_reason = f"{old_reason}\n{new_entry}" if old_reason else new_entry
-        supabase.table("profiles").update({
-            "violation_level": level,
-            "is_banned"      : is_ban,
-            "ban_reason"     : combined_reason,
-        }).eq("id",user_id).execute()
-        level_vi = {1:"Cảnh báo",2:"Nghiêm trọng",3:"Khóa tài khoản"}
-        send_notification(user_id,"content_removed",
-            f"⚠️ Tài khoản bị {'khóa' if is_ban else 'cảnh báo'}",
-            f'Tài khoản ở mức {level_vi.get(level,"?")}. Lý do: {reason}. '
-            f'{"Bạn có thể kháng cáo." if is_ban else "Hãy tuân thủ quy tắc cộng đồng."}',
-            None,None)
-        return f"✅ Đã {'khóa' if is_ban else 'cảnh báo'} user `{user_id[:8]}` mức {level}."
+        return _ban_user_internal(user_id, reason, level)
 
     # ── unban_user ────────────────────────────────────────────────────────────
     if tool == "unban_user":
@@ -1188,13 +1091,41 @@ def execute_tool(tool: str, inp: dict) -> str:
             "violation_level"   : 0,
             "is_banned"         : False,
             "ban_reason"        : None,
-            "redemption_points" : 0,
         }).eq("id",user_id).execute()
         send_notification(user_id,"appeal_approved",
             "✅ Tài khoản đã được mở khóa",
             f'Tài khoản đã mở khóa. Lý do: {reason}. Vui lòng tuân thủ quy tắc.',
             None,None)
+        _audit("unban_user", "user", user_id, reason)
         return f"✅ Đã mở khóa user `{user_id[:8]}`."
+
+    # ── get_audit_log ─────────────────────────────────────────────────────────
+    if tool == "get_audit_log":
+        action_filter = inp.get("action","")
+        target_id     = inp.get("target_id","")
+        days          = int(inp.get("days",30))
+        limit         = int(inp.get("limit",50))
+        since_iso = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() - days*86400, tz=timezone.utc
+        ).isoformat()
+
+        q = supabase.table("audit_logs").select("*").gte("created_at", since_iso)
+        if action_filter:
+            q = q.eq("action", action_filter)
+        if target_id:
+            q = q.eq("target_id", target_id)
+        r = q.order("created_at",desc=True).limit(limit).execute()
+
+        if not r.data:
+            return f"✅ Không có audit log nào trong {days} ngày qua khớp bộ lọc."
+        lines = [f"📝 **{len(r.data)} bản ghi audit log ({days} ngày qua):**\n"]
+        for l in r.data:
+            lines.append(
+                f"🕐 {l['created_at'][:16]} | 👤 actor: {l.get('actor','ai')}\n"
+                f"⚡ {l['action']} → {l.get('target_type','?')} `{(l.get('target_id') or '')[:8]}`\n"
+                f"💬 {l.get('reason','(không có)')}\n---"
+            )
+        return "\n".join(lines)
 
     # ── get_stats ─────────────────────────────────────────────────────────────
     if tool == "get_stats":
@@ -1208,6 +1139,10 @@ def execute_tool(tool: str, inp: dict) -> str:
                .eq("status","pending").not_.is_("removed_reason","null").execute()
         ap   = supabase.table("answers").select("id",count="exact")\
                .eq("moderation_status","pending").not_.is_("removed_reason","null").execute()
+        dq   = supabase.table("questions").select("id",count="exact")\
+               .not_.is_("deleted_at","null").execute()
+        da   = supabase.table("answers").select("id",count="exact")\
+               .not_.is_("deleted_at","null").execute()
         r_counts  = Counter(r["status"] for r in (rpts.data or []))
         a_counts  = Counter(a["status"] for a in (apps.data or []))
         b_counts  = Counter(b["status"] for b in (bans.data or []))
@@ -1220,6 +1155,9 @@ def execute_tool(tool: str, inp: dict) -> str:
             f"  Báo cáo processing  : {r_counts.get('processing',0)}\n"
             f"  Kháng cáo nội dung  : {a_counts.get('pending',0)}\n"
             f"  Kháng cáo ban       : {b_counts.get('pending',0)}\n\n"
+            f"♻️  Đang xóa mềm (khôi phục được):\n"
+            f"  Câu hỏi   : {dq.count or 0}\n"
+            f"  Câu trả lời: {da.count or 0}\n\n"
             f"🚫 Vi phạm đã xử lý: {len(logs.data or [])}\n"
             + "\n".join(f"  {k}: {v}" for k,v in l_counts.items()) +
             f"\n\n🚩 Báo cáo:\n"
@@ -1232,59 +1170,179 @@ def execute_tool(tool: str, inp: dict) -> str:
 
     # ── get_violation_analytics ──────────────────────────────────────────────
     if tool == "get_violation_analytics":
-        days = int(inp.get("days",7) or 7)
-        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        days = int(inp.get("days",30))
+        since_iso = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() - days*86400, tz=timezone.utc
+        ).isoformat()
 
         logs = supabase.table("moderation_logs")\
             .select("user_id,ref_type,label,created_at,profiles(username)")\
-            .gte("created_at",since)\
-            .order("created_at",desc=True).limit(500).execute()
-        data = logs.data or []
+            .gte("created_at",since_iso)\
+            .order("created_at",desc=False).limit(500).execute()
+        ld = logs.data or []
 
-        # Top user vi phạm nhiều nhất
-        user_counter = Counter()
-        username_map = {}
-        for l in data:
-            uid = l.get("user_id")
-            if not uid: continue
-            user_counter[uid] += 1
+        if not ld:
+            return f"✅ Không có vi phạm nào trong {days} ngày qua."
+
+        top_users = Counter()
+        by_type   = Counter()
+        by_day    = Counter()
+        uname_map = {}
+        for l in ld:
+            uid = l.get("user_id","?")
+            top_users[uid] += 1
+            by_type[l.get("ref_type","?")] += 1
+            by_day[l.get("created_at","")[:10]] += 1
             if l.get("profiles"):
-                username_map[uid] = l["profiles"].get("username","?")
+                uname_map[uid] = l["profiles"].get("username","?")
 
-        top_users = user_counter.most_common(10)
+        result = f"📊 **PHÂN TÍCH VI PHẠM ({days} ngày qua, {len(ld)} bản ghi)**\n\n"
+        result += "🔝 **Top 10 user vi phạm nhiều nhất:**\n"
+        for uid, cnt in top_users.most_common(10):
+            uname = uname_map.get(uid, uid[:8] if uid != "?" else "?")
+            result += f"  • {uname} (`{uid[:8]}`): {cnt} lần\n"
 
-        # Số nội dung xóa theo loại
-        type_counter  = Counter(l["ref_type"] for l in data if l.get("ref_type"))
-        label_counter = Counter(l["label"]    for l in data if l.get("label"))
+        result += "\n📂 **Theo loại nội dung:**\n"
+        for t, cnt in by_type.most_common():
+            result += f"  • {t}: {cnt}\n"
 
-        # Timeline theo ngày
-        day_counter = Counter((l.get("created_at") or "")[:10] for l in data)
+        result += "\n📅 **Timeline theo ngày (10 ngày gần nhất có vi phạm):**\n"
+        for day, cnt in sorted(by_day.items())[-10:]:
+            result += f"  • {day}: {cnt} vi phạm\n"
 
-        lines = [f"📊 **THỐNG KÊ VI PHẠM ({days} ngày gần nhất, {len(data)} bản ghi)**\n"]
-
-        lines.append("🏆 Top user vi phạm nhiều nhất:")
-        if top_users:
-            for uid, cnt in top_users:
-                uname = username_map.get(uid, uid[:8])
-                lines.append(f"  {uname} (`{uid[:8]}`): {cnt} lần")
-        else:
-            lines.append("  (không có dữ liệu)")
-
-        lines.append("\n📁 Vi phạm theo loại nội dung:")
-        for k, v in type_counter.items():
-            lines.append(f"  {k}: {v}")
-
-        lines.append("\n🏷️ Vi phạm theo nhãn:")
-        for k, v in label_counter.items():
-            lines.append(f"  {k}: {v}")
-
-        lines.append("\n📅 Timeline (theo ngày):")
-        for day in sorted(day_counter.keys()):
-            lines.append(f"  {day}: {day_counter[day]} vi phạm")
-
-        return "\n".join(lines)
+        return result
 
     return f"Tool '{tool}' không tồn tại."
+
+# ── Internal helpers dùng chung nhiều tool ───────────────────────────────────
+def _check_confirm_token(token: str, expected_action: str, expected_payload: dict) -> bool:
+    """Xác nhận token hợp lệ, chưa hết hạn, và payload khớp đúng với lúc request_bulk_action."""
+    if not token or token not in _pending_confirms:
+        return False
+    entry = _pending_confirms[token]
+    if entry["expires"] < time.time():
+        del _pending_confirms[token]
+        return False
+    if entry["action"] != expected_action:
+        return False
+    # So khớp payload dạng JSON để tránh dùng token của 1 lô khác cho lô này
+    if json.dumps(entry["payload"], sort_keys=True) != json.dumps(expected_payload, sort_keys=True):
+        return False
+    del _pending_confirms[token]  # dùng 1 lần
+    return True
+
+def _soft_delete_one(ref_id: str, ref_type: str, reason: str) -> str:
+    """Xóa mềm 1 nội dung — set deleted_at thay vì xóa hẳn, lưu status cũ để restore đúng."""
+    if ref_type == "question":
+        r = supabase.table("questions").select("user_id,points_cost,title,status")\
+            .eq("id",ref_id).single().execute()
+        if not r.data: return "Không tìm thấy câu hỏi."
+        supabase.table("questions").update({
+            "status":"removed","removed_by_ai":True,
+            "removed_reason":f"Admin: {reason}",
+            "deleted_at": datetime.now(timezone.utc).isoformat(),
+            "deleted_by": "ai",
+            "status_before_delete": r.data.get("status"),
+        }).eq("id",ref_id).execute()
+        _refund_points(r.data["user_id"],r.data.get("points_cost",0),ref_id)
+        _log_violation(r.data["user_id"],ref_id,"question","REMOVED",f"Admin: {reason}")
+        send_notification(r.data["user_id"],"content_removed",
+            "⚠️ Câu hỏi bị xóa bởi Admin",
+            f'Câu hỏi "{r.data.get("title","")[:50]}" bị Admin xóa. Lý do: {reason}. '
+            f'Nội dung có thể được khôi phục trong 30 ngày nếu kháng cáo thành công.',
+            ref_id,"question")
+    else:
+        r = supabase.table("answers").select("user_id,body,moderation_status")\
+            .eq("id",ref_id).single().execute()
+        if not r.data: return "Không tìm thấy câu trả lời."
+        supabase.table("answers").update({
+            "moderation_status":"removed","removed_by_ai":True,
+            "removed_reason":f"Admin: {reason}",
+            "removed_content":r.data.get("body","")[:1000],
+            "deleted_at": datetime.now(timezone.utc).isoformat(),
+            "deleted_by": "ai",
+            "moderation_status_before_delete": r.data.get("moderation_status"),
+        }).eq("id",ref_id).execute()
+        _log_violation(r.data["user_id"],ref_id,"answer","REMOVED",f"Admin: {reason}")
+        send_notification(r.data["user_id"],"content_removed",
+            "⚠️ Câu trả lời bị xóa bởi Admin",
+            f'Câu trả lời bị Admin xóa. Lý do: {reason}. Có thể khôi phục trong 30 ngày nếu kháng cáo thành công.',
+            ref_id,"answer")
+    _audit("remove_content", ref_type, ref_id, reason)
+    return f"🚫 Đã xóa mềm {ref_type} `{ref_id[:8]}` (khôi phục được trong 30 ngày)."
+
+def _restore_one(ref_id: str, ref_type: str, reason: str) -> str:
+    """Khôi phục nội dung đã xóa mềm — trả về đúng status trước khi xóa."""
+    if ref_type == "question":
+        r = supabase.table("questions").select("status_before_delete,deleted_at")\
+            .eq("id",ref_id).single().execute()
+        if not r.data: return "Không tìm thấy câu hỏi."
+        if not r.data.get("deleted_at"):
+            return "Câu hỏi này không ở trạng thái xóa mềm (có thể đã bị xóa vĩnh viễn hoặc chưa từng bị xóa)."
+        restore_status = r.data.get("status_before_delete") or "open"
+        supabase.table("questions").update({
+            "status": restore_status,
+            "removed_by_ai": False,
+            "removed_reason": None,
+            "deleted_at": None,
+            "deleted_by": None,
+            "status_before_delete": None,
+        }).eq("id",ref_id).execute()
+    else:
+        r = supabase.table("answers").select("moderation_status_before_delete,deleted_at,user_id")\
+            .eq("id",ref_id).single().execute()
+        if not r.data: return "Không tìm thấy câu trả lời."
+        if not r.data.get("deleted_at"):
+            return "Câu trả lời này không ở trạng thái xóa mềm (có thể đã bị xóa vĩnh viễn hoặc chưa từng bị xóa)."
+        restore_status = r.data.get("moderation_status_before_delete") or "approved"
+        supabase.table("answers").update({
+            "moderation_status": restore_status,
+            "removed_by_ai": False,
+            "removed_reason": None,
+            "removed_content": None,
+            "deleted_at": None,
+            "deleted_by": None,
+            "moderation_status_before_delete": None,
+        }).eq("id",ref_id).execute()
+    _audit("restore_content", ref_type, ref_id, reason)
+    return f"♻️ Đã khôi phục {ref_type} `{ref_id[:8]}`."
+
+def _ban_user_internal(user_id: str, reason: str, level: int) -> str:
+    """Logic ban dùng chung cho ban_user đơn lẻ và bulk_ban_users."""
+    is_ban = level >= 3
+    p = supabase.table("profiles").select("ban_reason")\
+        .eq("id",user_id).single().execute()
+    old_reason = (p.data or {}).get("ban_reason") or ""
+    today = datetime.now(timezone.utc).strftime("%d/%m/%Y")
+    new_entry = f"[{today}] {reason}"
+    combined_reason = f"{old_reason}\n{new_entry}" if old_reason else new_entry
+    supabase.table("profiles").update({
+        "violation_level": level,
+        "is_banned"      : is_ban,
+        "ban_reason"     : combined_reason,
+    }).eq("id",user_id).execute()
+    level_vi = {1:"Cảnh báo",2:"Nghiêm trọng",3:"Khóa tài khoản"}
+    send_notification(user_id,"content_removed",
+        f"⚠️ Tài khoản bị {'khóa' if is_ban else 'cảnh báo'}",
+        f'Tài khoản ở mức {level_vi.get(level,"?")}. Lý do: {reason}. '
+        f'{"Bạn có thể kháng cáo." if is_ban else "Hãy tuân thủ quy tắc cộng đồng."}',
+        None,None)
+    _audit("ban_user", "user", user_id, reason, {"level": level})
+    return f"✅ Đã {'khóa' if is_ban else 'cảnh báo'} user `{user_id[:8]}` mức {level}."
+
+def _audit(action: str, target_type, target_id, reason: str, metadata: dict = None):
+    """Ghi 1 dòng vào audit_logs — không bao giờ raise để tránh làm hỏng hành động chính."""
+    try:
+        supabase.table("audit_logs").insert({
+            "actor": "ai",
+            "action": action,
+            "target_type": target_type,
+            "target_id": str(target_id) if target_id else None,
+            "reason": reason,
+            "metadata": metadata or {},
+        }).execute()
+    except Exception as e:
+        print(f"  ⚠️  Audit log error: {e}")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def send_notification(user_id, ntype, title, message,
@@ -1340,28 +1398,23 @@ def _notify_new_answer(answer):
         print(f"  ⚠️  Notify answer error: {e}")
 
 def _check_and_award_badges(user_id: str):
-    """Kiểm tra và trao huy hiệu"""
     try:
-        # Đếm câu trả lời
         a_count = supabase.table("answers")\
             .select("id",count="exact")\
             .eq("user_id",user_id)\
             .eq("moderation_status","approved").execute()
         a_total = a_count.count or 0
 
-        # Đếm câu trả lời được chấp nhận
         acc_count = supabase.table("answers")\
             .select("id",count="exact")\
             .eq("user_id",user_id)\
             .eq("is_accepted",True).execute()
         acc_total = acc_count.count or 0
 
-        # Điểm hiện tại
         p = supabase.table("profiles").select("points")\
             .eq("id",user_id).single().execute()
         points = p.data["points"] if p.data else 0
 
-        # Lấy badges đã có
         existing = supabase.table("user_badges")\
             .select("badge_code").eq("user_id",user_id).execute()
         existing_codes = {b["badge_code"] for b in (existing.data or [])}
@@ -1382,7 +1435,6 @@ def _check_and_award_badges(user_id: str):
                     "user_id"   : user_id,
                     "badge_code": code,
                 }).execute()
-                # Lấy thông tin badge
                 b = supabase.table("badges").select("name,icon")\
                     .eq("code",code).single().execute()
                 if b.data:
@@ -1434,21 +1486,18 @@ async def scanner_loop():
 async def scan_batch():
     if not supabase: return
     try:
-        # Câu hỏi pending chưa gắn cờ
         qs = supabase.table("questions")\
             .select("id,title,body,user_id,points_cost")\
             .eq("status","pending")\
             .is_("removed_reason","null")\
             .limit(BATCH_SIZE).execute()
 
-        # Câu trả lời pending chưa gắn cờ
         ans = supabase.table("answers")\
             .select("id,body,user_id,question_id")\
             .eq("moderation_status","pending")\
             .is_("removed_reason","null")\
             .limit(BATCH_SIZE).execute()
 
-        # Reports mới pending → đổi thành processing (chỉ 1 lần)
         rps = supabase.table("reports")\
             .select("id,ref_id,ref_type,reason,reporter_id")\
             .eq("status","pending")\
@@ -1470,14 +1519,11 @@ async def scan_batch():
 
 def process_item(itype, data):
     try:
-        # ── Report: tiếp nhận 1 lần duy nhất ────────────────────────────────
         if itype == "report":
-            # Đổi status → processing để không xử lý lại
             supabase.table("reports")\
                 .update({"status":"processing"})\
                 .eq("id",data["id"]).execute()
 
-            # Tạm khóa nội dung bị báo cáo
             if data["ref_type"] == "question":
                 supabase.table("questions")\
                     .update({"is_under_review":True})\
@@ -1487,7 +1533,6 @@ def process_item(itype, data):
                     .update({"is_under_review":True})\
                     .eq("id",data["ref_id"]).execute()
 
-            # Thông báo người bị báo cáo
             reported_user = None
             if data["ref_type"] == "question":
                 q = supabase.table("questions").select("user_id")\
@@ -1505,7 +1550,6 @@ def process_item(itype, data):
                     f'Nội dung tạm thời bị hạn chế cho đến khi admin xem xét xong.',
                     data["ref_id"],data["ref_type"])
 
-            # Thông báo người báo cáo (CHỈ 1 LẦN)
             if data.get("reporter_id"):
                 send_notification(data["reporter_id"],"report_resolved",
                     "📨 Báo cáo đã được tiếp nhận",
@@ -1515,7 +1559,6 @@ def process_item(itype, data):
             print(f"  🚩 Report {data['id'][:8]} → processing, content under review")
             return
 
-        # ── Question/Answer: hard rules ───────────────────────────────────────
         text = f"{data['title']} {data.get('body','') or ''}" \
                if itype == "question" else data["body"]
         label, reason = hard_rules(text)
@@ -1535,7 +1578,6 @@ def process_item(itype, data):
             _log_violation(data["user_id"],data["id"],itype,label,reason)
             print(f"  🚩 [{itype}] {data['id'][:8]} → flagged ({label})")
         else:
-            # Clean → approve
             if itype == "question":
                 supabase.table("questions").update({
                     "status"        : "open",
@@ -1547,7 +1589,6 @@ def process_item(itype, data):
                     "removed_by_ai"    : False,
                 }).eq("id",data["id"]).execute()
                 _notify_new_answer(data)
-                # Kiểm tra huy hiệu
                 _check_and_award_badges(data["user_id"])
             print(f"  ✅ [{itype}] {data['id'][:8]} → approved")
 
@@ -1566,7 +1607,7 @@ async def handle_jsonrpc(request: Request) -> dict:
             "result":{
                 "protocolVersion":"2024-11-05",
                 "capabilities"   :{"tools":{}},
-                "serverInfo"     :{"name":"hoibai-panel","version":"5.2.0"},
+                "serverInfo"     :{"name":"hoibai-panel","version":"6.0.0"},
             }
         }
     if method == "tools/list":
@@ -1602,7 +1643,7 @@ async def mcp_info():
     return {"jsonrpc":"2.0","result":{
         "protocolVersion":"2024-11-05",
         "capabilities"   :{"tools":{}},
-        "serverInfo"     :{"name":"hoibai-panel","version":"5.2.0"},
+        "serverInfo"     :{"name":"hoibai-panel","version":"6.0.0"},
     }}
 
 @app.post("/mcp")
@@ -1628,7 +1669,7 @@ async def sse_endpoint(request: Request, authorization: str = Header(None)):
             "params":{
                 "protocolVersion":"2024-11-05",
                 "capabilities"   :{"tools":{}},
-                "serverInfo"     :{"name":"hoibai-panel","version":"5.2.0"},
+                "serverInfo"     :{"name":"hoibai-panel","version":"6.0.0"},
             }
         }
         yield f"data: {json.dumps(init,ensure_ascii=False)}\n\n"
@@ -1683,14 +1724,14 @@ async def health():
         "scanner": "running" if (supabase and scan_task
                     and not scan_task.done()) else "disabled",
         "pending": counts,
-        "version": "5.2.0",
+        "version": "6.0.0",
     }
 
 @app.get("/")
 async def root():
     return {
         "service": "HoiBai Moderator",
-        "version": "5.2.0",
+        "version": "6.0.0",
         "mode"   : "manual_review via MCP",
         "mcp_url": f"{BASE_URL}/mcp",
     }
