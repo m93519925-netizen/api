@@ -12,7 +12,7 @@ from pydantic import BaseModel
 SUPABASE_URL  = os.getenv("SUPABASE_URL",         "")
 SUPABASE_KEY  = os.getenv("SUPABASE_SERVICE_KEY", "")
 ADMIN_TOKEN   = os.getenv("ADMIN_TOKEN",          "hoibai-admin-secret")
-BASE_URL      = os.getenv("BASE_URL",             "https://api-production-a365.up.railway.app")
+BASE_URL      = os.getenv("BASE_URL",             "https://api-production-8d4b7.up.railway.app")
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL",    "30"))
 BATCH_SIZE    = int(os.getenv("BATCH_SIZE",       "5"))
 
@@ -263,26 +263,77 @@ MCP_TOOLS = [
     },
     {
         "name"       : "bulk_ban_users",
-        "description": "Cảnh báo hoặc khóa NHIỀU user cùng lúc. BẮT BUỘC phải gọi với confirm_token hợp lệ lấy từ request_bulk_action trước, trừ khi dry_run=true để xem trước danh sách.",
+        "description": "Cảnh báo hoặc khóa NHIỀU user cùng lúc. Hỗ trợ 2 chế độ: (1) 'reason' + 'level' chung cho tất cả, HOẶC (2) 'items' để mỗi user có reason/level RIÊNG (ưu tiên 'items' nếu có cả hai). BẮT BUỘC phải gọi với confirm_token hợp lệ lấy từ request_bulk_action trước, trừ khi dry_run=true để xem trước danh sách.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "user_ids": {"type":"array","items":{"type":"string"},"description":"Danh sách UUID user"},
-                "reason"  : {"type":"string"},
-                "level"   : {"type":"integer","description":"1=cảnh báo vàng, 2=nghiêm trọng đỏ, 3=khóa"},
+                "user_ids": {"type":"array","items":{"type":"string"},"description":"Danh sách UUID user — dùng khi muốn 1 reason/level CHUNG cho tất cả (bỏ qua nếu dùng 'items')"},
+                "reason"  : {"type":"string","description":"Lý do CHUNG — chỉ dùng khi không truyền 'items'"},
+                "level"   : {"type":"integer","description":"Mức CHUNG (1/2/3) — chỉ dùng khi không truyền 'items'"},
+                "items": {
+                    "type": "array",
+                    "description": "Danh sách user MỖI user có reason/level RIÊNG — nếu truyền, bỏ qua 'user_ids'/'reason'/'level' ở trên",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "user_id": {"type":"string"},
+                            "reason" : {"type":"string","description":"Lý do RIÊNG cho user này"},
+                            "level"  : {"type":"integer","description":"Mức RIÊNG cho user này (1/2/3)"},
+                        },
+                        "required": ["user_id","reason","level"],
+                    },
+                },
                 "confirm_token": {"type":"string","description":"Token xác nhận lấy từ request_bulk_action — bắt buộc trừ khi dry_run=true"},
                 "dry_run": {"type":"boolean","description":"true = chỉ xem trước sẽ ảnh hưởng ai, KHÔNG thực thi, KHÔNG cần confirm_token"},
             },
-            "required": ["user_ids","reason","level"],
+        },
+    },
+    {
+        "name"       : "bulk_unban_users",
+        "description": "Mở khóa NHIỀU user cùng lúc. Hỗ trợ 2 chế độ: (1) 'reason' chung cho tất cả, HOẶC (2) 'items' để mỗi user có reason RIÊNG (ví dụ: người thì appeal được duyệt, người thì hết thời gian cảnh báo — lý do khác nhau). BẮT BUỘC confirm_token trước, trừ khi dry_run=true.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "user_ids": {"type":"array","items":{"type":"string"},"description":"Danh sách UUID user — dùng khi muốn 1 reason CHUNG (bỏ qua nếu dùng 'items')"},
+                "reason"  : {"type":"string","description":"Lý do CHUNG — chỉ dùng khi không truyền 'items'"},
+                "items": {
+                    "type": "array",
+                    "description": "Danh sách user MỖI user có reason RIÊNG — nếu truyền, bỏ qua 'user_ids'/'reason' ở trên",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "user_id": {"type":"string"},
+                            "reason" : {"type":"string","description":"Lý do mở khóa RIÊNG cho user này"},
+                        },
+                        "required": ["user_id","reason"],
+                    },
+                },
+                "confirm_token": {"type":"string","description":"Token xác nhận lấy từ request_bulk_action — bắt buộc trừ khi dry_run=true"},
+                "dry_run": {"type":"boolean","description":"true = chỉ xem trước sẽ ảnh hưởng ai, KHÔNG thực thi, KHÔNG cần confirm_token"},
+            },
+        },
+    },
+    {
+        "name"       : "bulk_remove_user_content",
+        "description": "Xóa mềm TOÀN BỘ câu hỏi + câu trả lời của 1 user (dùng khi ban user vi phạm nặng, muốn dọn sạch nội dung họ từng đăng cùng lúc thay vì xóa từng cái). Tất cả nội dung dùng CHUNG 1 reason vì cùng 1 quyết định xử lý user đó. BẮT BUỘC confirm_token trước, trừ khi dry_run=true.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "user_id": {"type":"string","description":"UUID user cần xóa toàn bộ nội dung"},
+                "reason" : {"type":"string","description":"Lý do chung cho việc xóa toàn bộ nội dung của user này"},
+                "confirm_token": {"type":"string","description":"Token xác nhận lấy từ request_bulk_action — bắt buộc trừ khi dry_run=true"},
+                "dry_run": {"type":"boolean","description":"true = chỉ xem trước sẽ xóa bao nhiêu nội dung, KHÔNG thực thi, KHÔNG cần confirm_token"},
+            },
+            "required": ["user_id","reason"],
         },
     },
     {
         "name"       : "request_bulk_action",
-        "description": "BƯỚC XÁC NHẬN bắt buộc trước khi chạy bulk_remove_content hoặc bulk_ban_users thật sự. Trả về confirm_token (hết hạn sau 5 phút) và bản tóm tắt số lượng/đối tượng sẽ bị ảnh hưởng để xác nhận lại trước khi thực thi.",
+        "description": "BƯỚC XÁC NHẬN bắt buộc trước khi chạy bulk_remove_content, bulk_ban_users, bulk_unban_users, hoặc bulk_remove_user_content thật sự. Trả về confirm_token (hết hạn sau 5 phút) và bản tóm tắt số lượng/đối tượng sẽ bị ảnh hưởng để xác nhận lại trước khi thực thi.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "action": {"type":"string","description":"'bulk_remove_content' hoặc 'bulk_ban_users'"},
+                "action": {"type":"string","description":"'bulk_remove_content', 'bulk_ban_users', 'bulk_unban_users', hoặc 'bulk_remove_user_content'"},
                 "payload": {"type":"object","description":"Tham số sẽ dùng khi thực thi thật (items hoặc user_ids+reason+level)"},
             },
             "required": ["action","payload"],
@@ -777,8 +828,9 @@ def execute_tool(tool: str, inp: dict) -> str:
     if tool == "request_bulk_action":
         action  = inp.get("action","")
         payload = inp.get("payload",{})
-        if action not in ("bulk_remove_content","bulk_ban_users"):
-            return "⚠️ action không hợp lệ. Chỉ hỗ trợ 'bulk_remove_content' hoặc 'bulk_ban_users'."
+        valid_actions = ("bulk_remove_content","bulk_ban_users","bulk_unban_users","bulk_remove_user_content")
+        if action not in valid_actions:
+            return f"⚠️ action không hợp lệ. Chỉ hỗ trợ: {', '.join(valid_actions)}."
 
         token = secrets.token_urlsafe(16)
         _pending_confirms[token] = {
@@ -786,7 +838,6 @@ def execute_tool(tool: str, inp: dict) -> str:
             "payload": payload,
             "expires": time.time() + CONFIRM_TTL_SECONDS,
         }
-        # dọn token hết hạn cũ
         for k in [k for k,v in _pending_confirms.items() if v["expires"] < time.time()]:
             del _pending_confirms[k]
 
@@ -797,15 +848,53 @@ def execute_tool(tool: str, inp: dict) -> str:
                 summary += f"  • {it.get('ref_type')} `{it.get('ref_id','')[:8]}` — lý do: {it.get('reason','(chưa có)')}\n"
             if len(items) > 20:
                 summary += f"  ... và {len(items)-20} nội dung khác\n"
-        else:
-            user_ids = payload.get("user_ids",[])
-            level = payload.get("level","?")
+
+        elif action == "bulk_ban_users":
+            ban_items = payload.get("items")
+            if ban_items:
+                summary = f"Sẽ BAN {len(ban_items)} user, MỖI user reason/level RIÊNG:\n"
+                for it in ban_items[:20]:
+                    summary += f"  • `{it.get('user_id','')[:8]}` mức {it.get('level','?')} — {it.get('reason','(chưa có)')}\n"
+                if len(ban_items) > 20:
+                    summary += f"  ... và {len(ban_items)-20} user khác\n"
+            else:
+                user_ids = payload.get("user_ids",[])
+                level = payload.get("level","?")
+                reason = payload.get("reason","")
+                summary = f"Sẽ áp dụng MỨC {level} cho {len(user_ids)} user, lý do chung: {reason}\n"
+                for uid in user_ids[:20]:
+                    summary += f"  • `{uid[:8]}`\n"
+                if len(user_ids) > 20:
+                    summary += f"  ... và {len(user_ids)-20} user khác\n"
+
+        elif action == "bulk_unban_users":
+            unban_items = payload.get("items")
+            if unban_items:
+                summary = f"Sẽ MỞ KHÓA {len(unban_items)} user, MỖI user reason RIÊNG:\n"
+                for it in unban_items[:20]:
+                    summary += f"  • `{it.get('user_id','')[:8]}` — {it.get('reason','(chưa có)')}\n"
+                if len(unban_items) > 20:
+                    summary += f"  ... và {len(unban_items)-20} user khác\n"
+            else:
+                user_ids = payload.get("user_ids",[])
+                reason = payload.get("reason","")
+                summary = f"Sẽ MỞ KHÓA {len(user_ids)} user, lý do chung: {reason}\n"
+                for uid in user_ids[:20]:
+                    summary += f"  • `{uid[:8]}`\n"
+                if len(user_ids) > 20:
+                    summary += f"  ... và {len(user_ids)-20} user khác\n"
+
+        else:  # bulk_remove_user_content
+            uid = payload.get("user_id","")
             reason = payload.get("reason","")
-            summary = f"Sẽ áp dụng MỨC {level} cho {len(user_ids)} user, lý do chung: {reason}\n"
-            for uid in user_ids[:20]:
-                summary += f"  • `{uid[:8]}`\n"
-            if len(user_ids) > 20:
-                summary += f"  ... và {len(user_ids)-20} user khác\n"
+            cnt_q = supabase.table("questions").select("id",count="exact")\
+                .eq("user_id",uid).is_("deleted_at","null").execute()
+            cnt_a = supabase.table("answers").select("id",count="exact")\
+                .eq("user_id",uid).is_("deleted_at","null").execute()
+            total = (cnt_q.count or 0) + (cnt_a.count or 0)
+            summary = (f"Sẽ XÓA MỀM TOÀN BỘ nội dung của user `{uid[:8]}`: "
+                       f"{cnt_q.count or 0} câu hỏi + {cnt_a.count or 0} câu trả lời "
+                       f"= {total} nội dung. Lý do chung: {reason}\n")
 
         return (
             f"📋 **XÁC NHẬN TRƯỚC KHI THỰC THI**\n\n{summary}\n"
@@ -844,34 +933,133 @@ def execute_tool(tool: str, inp: dict) -> str:
         _audit("bulk_remove_content", "batch", None, f"{len(items)} nội dung", {"count": len(items)})
         return f"🚫 **Đã xử lý {len(items)} nội dung:**\n" + "\n".join(results)
 
-    # ── bulk_ban_users (confirm step) ────────────────────────────────────────
+    # ── bulk_ban_users (2 chế độ: reason chung HOẶC items reason riêng) ─────
     if tool == "bulk_ban_users":
+        ban_items     = inp.get("items")
         user_ids      = inp.get("user_ids",[])
         reason        = inp.get("reason","")
-        level         = int(inp.get("level",1))
+        level         = int(inp.get("level",1)) if inp.get("level") is not None else 1
         confirm_token = inp.get("confirm_token","")
         dry_run       = bool(inp.get("dry_run",False))
-        if not user_ids:
-            return "⚠️ Danh sách user_ids rỗng."
+
+        # Chuẩn hoá về 1 danh sách [{user_id, reason, level}] dù dùng chế độ nào
+        if ban_items:
+            missing = [it for it in ban_items if not it.get("reason","").strip()]
+            if missing:
+                return f"⚠️ {len(missing)} user trong 'items' thiếu 'reason' riêng."
+            normalized = [{"user_id": it["user_id"], "reason": it["reason"], "level": int(it.get("level",1))} for it in ban_items]
+            payload_for_token = {"items": ban_items}
+        else:
+            if not user_ids:
+                return "⚠️ Cần truyền 'user_ids' (+reason/level chung) hoặc 'items' (reason/level riêng)."
+            normalized = [{"user_id": uid, "reason": reason, "level": level} for uid in user_ids]
+            payload_for_token = {"user_ids": user_ids, "reason": reason, "level": level}
 
         if dry_run:
-            lines = [f"👁️ **DRY RUN — sẽ áp mức {level} cho {len(user_ids)} user (chưa thực thi):**\n"]
-            for uid in user_ids:
-                lines.append(f"  • `{uid[:8]}`")
+            lines = [f"👁️ **DRY RUN — sẽ xử lý {len(normalized)} user (chưa thực thi):**\n"]
+            for it in normalized:
+                lines.append(f"  • `{it['user_id'][:8]}` mức {it['level']} — {it['reason']}")
             return "\n".join(lines)
 
-        payload = {"user_ids": user_ids, "reason": reason, "level": level}
-        if not _check_confirm_token(confirm_token, "bulk_ban_users", payload):
+        if not _check_confirm_token(confirm_token, "bulk_ban_users", payload_for_token):
             return ("⛔ Thiếu hoặc sai confirm_token. Gọi request_bulk_action với "
                      "action='bulk_ban_users' và payload giống hệt lần này trước, "
                      "rồi dùng confirm_token trả về để thực thi. Hoặc dùng dry_run=true để xem trước.")
 
         results = []
-        for uid in user_ids:
-            r = _ban_user_internal(uid, reason, level)
-            results.append(f"  • `{uid[:8]}` → {r}")
-        _audit("bulk_ban_users", "batch", None, reason, {"count": len(user_ids), "level": level})
-        return f"⚖️ **Đã xử lý {len(user_ids)} user:**\n" + "\n".join(results)
+        for it in normalized:
+            r = _ban_user_internal(it["user_id"], it["reason"], it["level"])
+            results.append(f"  • `{it['user_id'][:8]}` → {r}")
+        _audit("bulk_ban_users", "batch", None,
+               reason if not ban_items else "(mỗi user 1 lý do riêng, xem chi tiết từng dòng ban_user)",
+               {"count": len(normalized), "per_user_reason": bool(ban_items)})
+        return f"⚖️ **Đã xử lý {len(normalized)} user:**\n" + "\n".join(results)
+
+    # ── bulk_unban_users (2 chế độ: reason chung HOẶC items reason riêng) ────
+    if tool == "bulk_unban_users":
+        unban_items   = inp.get("items")
+        user_ids      = inp.get("user_ids",[])
+        reason        = inp.get("reason","Admin mở khóa")
+        confirm_token = inp.get("confirm_token","")
+        dry_run       = bool(inp.get("dry_run",False))
+
+        if unban_items:
+            missing = [it for it in unban_items if not it.get("reason","").strip()]
+            if missing:
+                return f"⚠️ {len(missing)} user trong 'items' thiếu 'reason' riêng."
+            normalized = [{"user_id": it["user_id"], "reason": it["reason"]} for it in unban_items]
+            payload_for_token = {"items": unban_items}
+        else:
+            if not user_ids:
+                return "⚠️ Cần truyền 'user_ids' (+reason chung) hoặc 'items' (reason riêng)."
+            normalized = [{"user_id": uid, "reason": reason} for uid in user_ids]
+            payload_for_token = {"user_ids": user_ids, "reason": reason}
+
+        if dry_run:
+            lines = [f"👁️ **DRY RUN — sẽ mở khóa {len(normalized)} user (chưa thực thi):**\n"]
+            for it in normalized:
+                lines.append(f"  • `{it['user_id'][:8]}` — {it['reason']}")
+            return "\n".join(lines)
+
+        if not _check_confirm_token(confirm_token, "bulk_unban_users", payload_for_token):
+            return ("⛔ Thiếu hoặc sai confirm_token. Gọi request_bulk_action với "
+                     "action='bulk_unban_users' và payload giống hệt lần này trước, "
+                     "rồi dùng confirm_token trả về để thực thi. Hoặc dùng dry_run=true để xem trước.")
+
+        results = []
+        for it in normalized:
+            r = _unban_user_internal(it["user_id"], it["reason"])
+            results.append(f"  • `{it['user_id'][:8]}` → {r}")
+        _audit("bulk_unban_users", "batch", None,
+               reason if not unban_items else "(mỗi user 1 lý do riêng, xem chi tiết từng dòng unban_user)",
+               {"count": len(normalized), "per_user_reason": bool(unban_items)})
+        return f"✅ **Đã mở khóa {len(normalized)} user:**\n" + "\n".join(results)
+
+    # ── bulk_remove_user_content ─────────────────────────────────────────────
+    if tool == "bulk_remove_user_content":
+        user_id       = inp.get("user_id","")
+        reason        = inp.get("reason","")
+        confirm_token = inp.get("confirm_token","")
+        dry_run       = bool(inp.get("dry_run",False))
+        if not user_id or not reason.strip():
+            return "⚠️ Cần cả 'user_id' và 'reason'."
+
+        qs = supabase.table("questions").select("id,title")\
+            .eq("user_id",user_id).is_("deleted_at","null").execute()
+        ans = supabase.table("answers").select("id,body")\
+            .eq("user_id",user_id).is_("deleted_at","null").execute()
+        q_list = qs.data or []
+        a_list = ans.data or []
+        total = len(q_list) + len(a_list)
+
+        if dry_run:
+            lines = [f"👁️ **DRY RUN — sẽ xóa mềm {total} nội dung của user `{user_id[:8]}` (chưa thực thi):**\n"]
+            for q in q_list[:15]:
+                lines.append(f"  • question `{q['id'][:8]}` — {q.get('title','')[:60]}")
+            for a in a_list[:15]:
+                lines.append(f"  • answer `{a['id'][:8]}` — {a.get('body','')[:60]}")
+            if total > 30:
+                lines.append(f"  ... và {total-30} nội dung khác")
+            return "\n".join(lines)
+
+        payload_for_token = {"user_id": user_id, "reason": reason}
+        if not _check_confirm_token(confirm_token, "bulk_remove_user_content", payload_for_token):
+            return ("⛔ Thiếu hoặc sai confirm_token. Gọi request_bulk_action với "
+                     "action='bulk_remove_user_content' và payload={'user_id':..., 'reason':...} giống hệt lần này trước, "
+                     "rồi dùng confirm_token trả về để thực thi. Hoặc dùng dry_run=true để xem trước.")
+
+        if total == 0:
+            return f"✅ User `{user_id[:8]}` không có nội dung nào cần xóa."
+
+        results = []
+        for q in q_list:
+            r = _soft_delete_one(q["id"], "question", reason)
+            results.append(f"  • question `{q['id'][:8]}` → {r}")
+        for a in a_list:
+            r = _soft_delete_one(a["id"], "answer", reason)
+            results.append(f"  • answer `{a['id'][:8]}` → {r}")
+        _audit("bulk_remove_user_content", "user", user_id, reason, {"items_count": total})
+        return f"🚫 **Đã xóa mềm {total} nội dung của user `{user_id[:8]}`:**\n" + "\n".join(results)
 
     # ── approve_appeal (chỉ kháng cáo nội dung: question/answer) ────────────────
     if tool == "approve_appeal":
@@ -1087,17 +1275,7 @@ def execute_tool(tool: str, inp: dict) -> str:
     if tool == "unban_user":
         user_id = inp.get("user_id","")
         reason  = inp.get("reason","Admin mở khóa")
-        supabase.table("profiles").update({
-            "violation_level"   : 0,
-            "is_banned"         : False,
-            "ban_reason"        : None,
-        }).eq("id",user_id).execute()
-        send_notification(user_id,"appeal_approved",
-            "✅ Tài khoản đã được mở khóa",
-            f'Tài khoản đã mở khóa. Lý do: {reason}. Vui lòng tuân thủ quy tắc.',
-            None,None)
-        _audit("unban_user", "user", user_id, reason)
-        return f"✅ Đã mở khóa user `{user_id[:8]}`."
+        return _unban_user_internal(user_id, reason)
 
     # ── get_audit_log ─────────────────────────────────────────────────────────
     if tool == "get_audit_log":
@@ -1329,6 +1507,20 @@ def _ban_user_internal(user_id: str, reason: str, level: int) -> str:
         None,None)
     _audit("ban_user", "user", user_id, reason, {"level": level})
     return f"✅ Đã {'khóa' if is_ban else 'cảnh báo'} user `{user_id[:8]}` mức {level}."
+
+def _unban_user_internal(user_id: str, reason: str) -> str:
+    """Logic unban dùng chung cho unban_user đơn lẻ và bulk_unban_users."""
+    supabase.table("profiles").update({
+        "violation_level"   : 0,
+        "is_banned"         : False,
+        "ban_reason"        : None,
+    }).eq("id",user_id).execute()
+    send_notification(user_id,"appeal_approved",
+        "✅ Tài khoản đã được mở khóa",
+        f'Tài khoản đã mở khóa. Lý do: {reason}. Vui lòng tuân thủ quy tắc.',
+        None,None)
+    _audit("unban_user", "user", user_id, reason)
+    return f"✅ Đã mở khóa user `{user_id[:8]}`."
 
 def _audit(action: str, target_type, target_id, reason: str, metadata: dict = None):
     """Ghi 1 dòng vào audit_logs — không bao giờ raise để tránh làm hỏng hành động chính."""
